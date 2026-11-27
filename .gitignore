@@ -1,0 +1,17 @@
+# 暫存與備份檔
+*.tmp
+*.tmp.*
+*.bak
+*.asar
+*.asar.bak
+
+# 執行日誌與鎖檔
+*.log
+*.lock
+
+# 系統與編輯器殘留
+.DS_Store
+Thumbs.db
+desktop.ini
+node_modules/
+sandbox*/
