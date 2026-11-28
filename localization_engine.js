@@ -2906,6 +2906,18 @@ function install20(resourcesDir) {
             ? "countItem.label = count > 0 ? `${count} 個代理執行中` : '無執行中的代理';"
             : "countItem.label = count > 0 ? `${count} 个智能体运行中` : '无运行中的智能体';";
         trayPatched = trayPatched.replace(countRegex, replacementCount);
+        trayPatched = trayPatched.replace(
+            /function\s+insertTrayMenuItem\s*\(\s*position\s*,\s*options\s*\)\s*\{/,
+            `function insertTrayMenuItem(position, options) {
+    /* --- TRAY TRANSLATION START --- */
+    try {
+        if (options && options.label) {
+            const _trayDynamicMap = ${USE_TW ? `{ 'Connect to WSL': '連線至 WSL', 'Reopen Locally': '在本機重新開啟' }` : `{ 'Connect to WSL': '连接到 WSL', 'Reopen Locally': '在本地重新打开' }`};
+            if (_trayDynamicMap[options.label]) options = { ...options, label: _trayDynamicMap[options.label] };
+        }
+    } catch (_) {}
+    /* --- TRAY TRANSLATION END --- */`
+        );
         replacements['dist/tray.js'] = trayPatched;
         console.log(`[修改] 系統匣中文化注入完成！`);
     }
@@ -2969,9 +2981,17 @@ function install20(resourcesDir) {
                 _fs.appendFileSync(_path.join(guardDir, 'guard.log'), '[' + ts + '] [HOOK] ' + text + '\n', 'utf8');
             } catch (_e) {}
         }
+        function _getAutoUpdaterObj() {
+            try {
+                const _eu = (typeof electron_updater_1 !== 'undefined' && electron_updater_1) || require('electron-updater');
+                return _eu && _eu.autoUpdater ? _eu.autoUpdater : null;
+            } catch (_e) {
+                return null;
+            }
+        }
         function _spawnLocalizationUpdateWatchdog(isSilentMode, shouldAutoRelaunch) {
             if (_watchdogSpawned || process.platform !== 'win32') return false;
-            const updaterObj = electron_updater_1 && electron_updater_1.autoUpdater;
+            const updaterObj = _getAutoUpdaterObj();
             if (!updaterObj || !updaterObj.installerPath) return false;
             const localAppData = process.env.LOCALAPPDATA || _path.join(_os.homedir(), 'AppData', 'Local');
             if (!localAppData) return false;
@@ -3003,9 +3023,10 @@ function install20(resourcesDir) {
             console.log('[AutoUpdater][TW-Guard] Post-update localization watchdog armed (relaunch=' + shouldAutoRelaunch + ', silent=' + isSilentMode + ')');
             return true;
         }
-        if (electron_updater_1 && electron_updater_1.autoUpdater && typeof electron_updater_1.autoUpdater.quitAndInstall === 'function') {
-            const _origQuitAndInstall = electron_updater_1.autoUpdater.quitAndInstall.bind(electron_updater_1.autoUpdater);
-            electron_updater_1.autoUpdater.quitAndInstall = function (isSilent, isForceRunAfter) {
+        const _au = _getAutoUpdaterObj();
+        if (_au && typeof _au.quitAndInstall === 'function') {
+            const _origQuitAndInstall = _au.quitAndInstall.bind(_au);
+            _au.quitAndInstall = function (isSilent, isForceRunAfter) {
                 const silentFlag = Boolean(isSilent);
                 const shouldAutoRelaunch = !silentFlag || Boolean(isForceRunAfter);
                 const effectiveForceRun = (silentFlag && isForceRunAfter) ? false : isForceRunAfter;
@@ -3015,12 +3036,30 @@ function install20(resourcesDir) {
                 } catch (_e) {}
                 const res = _origQuitAndInstall(isSilent, effectiveForceRun);
                 try {
-                    if (spawned && electron_updater_1.autoUpdater && !electron_updater_1.autoUpdater.quitAndInstallCalled) {
-                        setTimeout(function () { _watchdogSpawned = false; }, 1000);
+                    if (spawned && !_au.quitAndInstallCalled) {
+                        _watchdogSpawned = false;
                     }
                 } catch (_e) {}
                 return res;
             };
+            if (typeof _au.install === 'function') {
+                const _origInstall = _au.install.bind(_au);
+                _au.install = function (isSilent, isForceRunAfter) {
+                    const silentFlag = Boolean(isSilent);
+                    const shouldAutoRelaunch = !silentFlag || Boolean(isForceRunAfter);
+                    const effectiveForceRun = (silentFlag && isForceRunAfter) ? false : isForceRunAfter;
+                    if (!_watchdogSpawned) {
+                        try {
+                            _spawnLocalizationUpdateWatchdog(silentFlag, shouldAutoRelaunch);
+                        } catch (_e) {}
+                    }
+                    const ok = _origInstall(isSilent, effectiveForceRun);
+                    if (!ok && !_au.quitAndInstallCalled) {
+                        _watchdogSpawned = false;
+                    }
+                    return ok;
+                };
+            }
         }
     } catch (_err) {}
 })();
@@ -3084,7 +3123,7 @@ function install20(resourcesDir) {
     try {
         surgicalPatchAsar(sourceAsarPath, tempAsarPath, replacements);
         const installDirFromRes = path.dirname(resourcesDir);
-        const maxRenameTries = IS_AUTO_MODE ? 1 : (IS_TAKEOVER_POST_UPDATE ? 10 : 5);
+        const maxRenameTries = IS_AUTO_MODE ? 1 : (IS_TAKEOVER_POST_UPDATE ? 15 : 5);
         let renamed = false;
         let lastRenameErr = null;
         for (let attempt = 1; attempt <= maxRenameTries; attempt++) {
@@ -3514,7 +3553,7 @@ function buildUpdateWatchdogVbs() {
         '    Err.Clear',
         'End Function',
         '',
-        'Dim installDir, oldPid, relaunchFlag',
+        'Dim installDir, oldPid, relaunchFlag, cfgDirPath',
         'installDir = ""',
         'oldPid = 0',
         'relaunchFlag = "0"',
@@ -3524,7 +3563,19 @@ function buildUpdateWatchdogVbs() {
         'End If',
         'If WScript.Arguments.Count >= 3 Then relaunchFlag = WScript.Arguments(2)',
         'If installDir = "" Then',
-        '    installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
+        '    cfgDirPath = guardDir & "\\install_dir.txt"',
+        '    installDir = ReadFirstLineAuto(cfgDirPath)',
+        'End If',
+        'If installDir = "" Or Not fso.FileExists(installDir & "\\Antigravity.exe") Then',
+        '    If fso.FileExists(sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity\\Antigravity.exe") Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
+        '    ElseIf fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\\Antigravity\\Antigravity.exe") Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\\Antigravity"',
+        '    ElseIf fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\\Antigravity\\Antigravity.exe") Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\\Antigravity"',
+        '    ElseIf installDir = "" Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
+        '    End If',
         'End If',
         'Do While Right(installDir, 1) = "\\" Or Right(installDir, 1) = "/"',
         '    installDir = Left(installDir, Len(installDir) - 1)',
@@ -3639,11 +3690,23 @@ function buildUpdateWatchdogVbs() {
         '    If IsInstallerRunning Then Exit Function',
         '    Dim col, item, ep, cl',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'installer.exe\' AND ExecutablePath LIKE \'%antigravity-updater%\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE ExecutablePath LIKE \'%antigravity-updater%\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
-        '            IsInstallerRunning = True',
-        '            Exit Function',
+        '            If Not IsLocalizationScriptCmd(item.CommandLine) Then',
+        '                IsInstallerRunning = True',
+        '                Exit Function',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name LIKE \'Antigravity-%.exe\' OR Name LIKE \'AntigravitySetup%.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If Not IsLocalizationScriptCmd(item.CommandLine) Then',
+        '                IsInstallerRunning = True',
+        '                Exit Function',
+        '            End If',
         '        Next',
         '    End If',
         '    Err.Clear',
@@ -3659,7 +3722,7 @@ function buildUpdateWatchdogVbs() {
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'old-uninstaller.exe\' OR Name LIKE \'Au_%.exe\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name LIKE \'old-uninstaller%.exe\' OR Name LIKE \'Au_%.exe\' OR Name LIKE \'Un_%.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
         '            If IsNull(item.ExecutablePath) Then ep = "" Else ep = LCase(CStr(item.ExecutablePath))',
@@ -3750,55 +3813,126 @@ function buildUpdateWatchdogVbs() {
         '    langArg = " --cn"',
         'End If',
         '',
-        'Dim cmdCheck, cmdPatch, rcCheck, rcPatch, attempt, didTakeover, needRelaunch, completed, didPatch, unchangedWaits',
+        'Function FindNodeExe()',
+        '    FindNodeExe = ""',
+        '    Dim c1, c2, c3',
+        '    c1 = sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\\nodejs\\node.exe"',
+        '    c2 = sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\\nodejs\\node.exe"',
+        '    c3 = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\nodejs\\node.exe"',
+        '    If fso.FileExists(c1) Then',
+        '        FindNodeExe = c1',
+        '    ElseIf fso.FileExists(c2) Then',
+        '        FindNodeExe = c2',
+        '    ElseIf fso.FileExists(c3) Then',
+        '        FindNodeExe = c3',
+        '    End If',
+        'End Function',
+        '',
+        'Function RunEngineCmd(useNode, engineArgs)',
+        '    On Error Resume Next',
+        '    Dim rc, cmdLine',
+        '    RunEngineCmd = -999',
+        '    If useNode Then',
+        '        Dim ne',
+        '        ne = FindNodeExe()',
+        '        If ne = "" Then Exit Function',
+        '        Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '        cmdLine = """" & ne & """ """ & enginePath & """" & engineArgs',
+        '    Else',
+        '        sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
+        '        cmdLine = """" & exePath & """ """ & enginePath & """" & engineArgs',
+        '    End If',
+        '    Err.Clear',
+        '    rc = -999',
+        '    rc = sh.Run(cmdLine, 0, True)',
+        '    If Err.Number <> 0 Then',
+        '        rc = -999',
+        '        Err.Clear',
+        '    End If',
+        '    Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '    RunEngineCmd = rc',
+        'End Function',
+        '',
+        'Function RunCheckWithFallback(engineArgs)',
+        '    Dim rc',
+        '    rc = RunEngineCmd(False, engineArgs)',
+        '    If rc <> 0 And rc <> 10 Then',
+        '        Dim rcNode',
+        '        rcNode = RunEngineCmd(True, engineArgs)',
+        '        If rcNode = 0 Or rcNode = 10 Then rc = rcNode',
+        '    End If',
+        '    RunCheckWithFallback = rc',
+        'End Function',
+        '',
+        'Function RunPatchWithFallback(engineArgs)',
+        '    Dim rc',
+        '    rc = RunEngineCmd(False, engineArgs)',
+        '    If rc <> 0 Then',
+        '        Dim rcNode',
+        '        rcNode = RunEngineCmd(True, engineArgs)',
+        '        If rcNode = 0 Then rc = rcNode',
+        '    End If',
+        '    RunPatchWithFallback = rc',
+        'End Function',
+        '',
+        'Dim checkArgs, patchArgs, rcCheck, rcPatch, attempt, totalTicks, didTakeover, needRelaunch, completed, didPatch, unchangedWaits',
         'didTakeover = False',
         'needRelaunch = (relaunchFlag = "1")',
         'completed = False',
         'didPatch = False',
         'unchangedWaits = 0',
+        'attempt = 0',
+        'totalTicks = 0',
         '',
-        'For attempt = 1 To 12',
+        'Do While attempt < 15 And totalTicks < 45',
+        '    totalTicks = totalTicks + 1',
         '    If IsInstallerRunning() Then',
         '        sawInstaller = True',
-        '        WriteWatchdogLog "Attempt " & attempt & ": installer still active; waiting."',
+        '        WriteWatchdogLog "Tick " & totalTicks & ": installer still active; waiting."',
         '        WScript.Sleep 1500',
         '    ElseIf Not fso.FileExists(exePath) Then',
+        '        attempt = attempt + 1',
         '        WriteWatchdogLog "Attempt " & attempt & ": waiting for Antigravity.exe to appear."',
         '        WScript.Sleep 1500',
         '    Else',
-        '        cmdCheck = """" & exePath & """ """ & enginePath & """" & langArg & " --check-patch-needed --install-dir """ & installDir & """"',
-        '        cmdPatch = """" & exePath & """ """ & enginePath & """" & langArg & " --brand-title english --takeover-post-update --no-guard --quiet --install-dir """ & installDir & """"',
-        '        sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
-        '        rcCheck = sh.Run(cmdCheck, 0, True)',
-        '        Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '        checkArgs = langArg & " --check-patch-needed --install-dir """ & installDir & """"',
+        '        patchArgs = langArg & " --brand-title english --takeover-post-update --no-guard --quiet --install-dir """ & installDir & """"',
+        '        rcCheck = RunCheckWithFallback(checkArgs)',
         '',
         '        If rcCheck = 0 Then',
-        '            If Not didPatch And Not sawInstaller And preAsarStamp <> "" And GetAsarStamp(asarPath) = preAsarStamp And unchangedWaits < 5 Then',
-        '                WriteWatchdogLog "Attempt " & attempt & ": ASAR unchanged since pre-update; waiting for installer."',
+        '            If Not didPatch And preAsarStamp <> "" And GetAsarStamp(asarPath) = preAsarStamp And unchangedWaits < 20 Then',
         '                unchangedWaits = unchangedWaits + 1',
-        '                WScript.Sleep 2000',
+        '                WriteWatchdogLog "Wait " & unchangedWaits & ": ASAR unchanged since pre-update; waiting for installer."',
+        '                WScript.Sleep 1500',
+        '            ElseIf IsInstallerRunning() Then',
+        '                sawInstaller = True',
+        '                WriteWatchdogLog "Tick " & totalTicks & ": installer became active after check; waiting."',
+        '                WScript.Sleep 1500',
         '            Else',
+        '                attempt = attempt + 1',
         '                If (needRelaunch Or didTakeover) And Not HasAppRunningInDir(installDir) Then',
         '                    If fso.FileExists(launchVbsPath) Then',
+        '                        Err.Clear',
         '                        sh.Run """" & wscriptExe & """ //B //Nologo """ & launchVbsPath & """ """ & exePath & """ """ & installDir & """", 0, True',
         '                    Else',
+        '                        Err.Clear',
         '                        sh.Run """" & exePath & """", 1, False',
         '                    End If',
+        '                    Err.Clear',
         '                    WriteWatchdogLog "Verified localized on attempt " & attempt & "; launched Antigravity GUI."',
         '                Else',
         '                    WriteWatchdogLog "Verified localized on attempt " & attempt & "; already running or no launch needed."',
         '                End If',
         '                WScript.Sleep 1500',
-        '                sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
-        '                rcCheck = sh.Run(cmdCheck, 0, True)',
-        '                Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
-        '                If rcCheck = 0 Then',
+        '                rcCheck = RunCheckWithFallback(checkArgs)',
+        '                If rcCheck = 0 And Not IsInstallerRunning() Then',
         '                    completed = True',
-        '                    Exit For',
+        '                    Exit Do',
         '                End If',
-        '                WriteWatchdogLog "Post-launch verification detected reversion; retrying localization."',
+        '                WriteWatchdogLog "Post-launch verification detected reversion or active installer; retrying localization."',
         '            End If',
         '        ElseIf rcCheck = 10 Then',
+        '            attempt = attempt + 1',
         '            If HasAppRunningInDir(installDir) Then',
         '                didTakeover = True',
         '                needRelaunch = True',
@@ -3806,9 +3940,7 @@ function buildUpdateWatchdogVbs() {
         '            Else',
         '                WriteWatchdogLog "Attempt " & attempt & ": unlocalized ASAR detected; applying localization."',
         '            End If',
-        '            sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
-        '            rcPatch = sh.Run(cmdPatch, 0, True)',
-        '            Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '            rcPatch = RunPatchWithFallback(patchArgs)',
         '            If rcPatch <> 0 Then',
         '                WriteWatchdogLog "Attempt " & attempt & ": patch returned rc=" & rcPatch & "; retrying."',
         '                WScript.Sleep 1500',
@@ -3817,14 +3949,15 @@ function buildUpdateWatchdogVbs() {
         '                WScript.Sleep 400',
         '            End If',
         '        Else',
+        '            attempt = attempt + 1',
         '            WriteWatchdogLog "Attempt " & attempt & ": ASAR not ready (rc=" & rcCheck & "); retrying."',
         '            WScript.Sleep 1500',
         '        End If',
         '    End If',
-        'Next',
+        'Loop',
         '',
         'If Not completed Then',
-        '    WriteWatchdogLog "Finished 12 attempts without complete verification."',
+        '    WriteWatchdogLog "Finished " & attempt & " attempts (" & totalTicks & " ticks) without complete verification."',
         'End If',
         '',
         'Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
@@ -3865,17 +3998,20 @@ function buildGuardVbs() {
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'Antigravity-x64.exe\' OR Name=\'Antigravity-arm64.exe\' OR Name=\'Uninstall Antigravity.exe\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'Uninstall Antigravity.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
         '            WScript.Quit 0',
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'installer.exe\' AND ExecutablePath LIKE \'%antigravity-updater%\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE ExecutablePath LIKE \'%antigravity-updater%\' OR Name LIKE \'Antigravity-%.exe\' OR Name LIKE \'AntigravitySetup%.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
-        '            WScript.Quit 0',
+        '            If IsNull(item.CommandLine) Then cmdVal = "" Else cmdVal = LCase(CStr(item.CommandLine))',
+        '            If InStr(1, cmdVal, "localization_engine.js", 1) = 0 Then',
+        '                WScript.Quit 0',
+        '            End If',
         '        Next',
         '    End If',
         '    Err.Clear',
@@ -3890,7 +4026,7 @@ function buildGuardVbs() {
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'old-uninstaller.exe\' OR Name LIKE \'Au_%.exe\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name LIKE \'old-uninstaller%.exe\' OR Name LIKE \'Au_%.exe\' OR Name LIKE \'Un_%.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
         '            If IsNull(item.ExecutablePath) Then epVal = "" Else epVal = LCase(CStr(item.ExecutablePath))',
@@ -3951,8 +4087,16 @@ function buildGuardVbs() {
         'Dim installDir, cfgPath, exePath, enginePath',
         'cfgPath = guardDir & "\\install_dir.txt"',
         'installDir = ReadFirstLineAuto(cfgPath)',
-        'If installDir = "" Then',
-        '    installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
+        'If installDir = "" Or Not fso.FileExists(installDir & "\\Antigravity.exe") Then',
+        '    If fso.FileExists(sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity\\Antigravity.exe") Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
+        '    ElseIf fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\\Antigravity\\Antigravity.exe") Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\\Antigravity"',
+        '    ElseIf fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\\Antigravity\\Antigravity.exe") Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\\Antigravity"',
+        '    ElseIf installDir = "" Then',
+        '        installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
+        '    End If',
         'End If',
         '',
         'Dim langArg, langModePath, langModeVal',
@@ -3967,12 +4111,31 @@ function buildGuardVbs() {
         '',
         'exePath = installDir & "\\Antigravity.exe"',
         'enginePath = guardDir & "\\localization_engine.js"',
-        'If fso.FileExists(exePath) And fso.FileExists(enginePath) Then',
-        '    sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
-        '    Dim cmd',
-        '    cmd = """" & exePath & """ """ & enginePath & """" & langArg & " --brand-title english --auto --if-needed --quiet --install-dir """ & installDir & """"',
-        '    sh.Run cmd, 0, True',
-        '    Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        'If fso.FileExists(enginePath) Then',
+        '    Dim gArgs, gRc, nodeAlt',
+        '    gArgs = langArg & " --brand-title english --auto --if-needed --quiet --install-dir """ & installDir & """"',
+        '    gRc = -999',
+        '    If fso.FileExists(exePath) Then',
+        '        sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
+        '        Err.Clear',
+        '        gRc = sh.Run("""" & exePath & """ """ & enginePath & """" & gArgs, 0, True)',
+        '        If Err.Number <> 0 Then',
+        '            gRc = -999',
+        '            Err.Clear',
+        '        End If',
+        '        Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '    End If',
+        '    If gRc <> 0 Then',
+        '        nodeAlt = sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\\nodejs\\node.exe"',
+        '        If Not fso.FileExists(nodeAlt) Then nodeAlt = sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\\nodejs\\node.exe"',
+        '        If Not fso.FileExists(nodeAlt) Then nodeAlt = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\nodejs\\node.exe"',
+        '        If fso.FileExists(nodeAlt) Then',
+        '            Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '            Err.Clear',
+        '            gRc = sh.Run("""" & nodeAlt & """ """ & enginePath & """" & gArgs, 0, True)',
+        '            Err.Clear',
+        '        End If',
+        '    End If',
         'End If',
         '',
         'lockStream.Close'
@@ -4010,7 +4173,7 @@ function buildGuardTaskXml(guardVbsPath, workingDir) {
 `      <StartBoundary>${startBoundary}</StartBoundary>\r\n` +
 `      <Enabled>true</Enabled>\r\n` +
 `      <Repetition>\r\n` +
-`        <Interval>PT15M</Interval>\r\n` +
+`        <Interval>PT3M</Interval>\r\n` +
 `        <StopAtDurationEnd>false</StopAtDurationEnd>\r\n` +
 `      </Repetition>\r\n` +
 `    </TimeTrigger>\r\n` +
@@ -4136,7 +4299,7 @@ function installAutoGuard(installDir) {
                 const sysRoot = process.env.SystemRoot || 'C:\\Windows';
                 const wscriptExe = path.join(sysRoot, 'System32', 'wscript.exe');
                 child_process.execSync(
-                    `schtasks /Create /TN "${GUARD_TASK_NAME}" /TR "\\"${wscriptExe}\\" //B //Nologo \\"${guardVbsPath}\\"" /SC MINUTE /MO 15 /F`,
+                    `schtasks /Create /TN "${GUARD_TASK_NAME}" /TR "\\"${wscriptExe}\\" //B //Nologo \\"${guardVbsPath}\\"" /SC MINUTE /MO 3 /F`,
                     { stdio: 'pipe', windowsHide: true }
                 );
                 taskOk = true;
@@ -4447,7 +4610,7 @@ function main() {
         }
         if (success) {
             restoreProxyIfNeeded(installDir);
-            if (!IS_AUTO_MODE && process.platform === 'win32') {
+            if (!IS_AUTO_MODE && !IS_NO_GUARD && process.platform === 'win32') {
                 uninstallAutoGuard();
             }
         }
