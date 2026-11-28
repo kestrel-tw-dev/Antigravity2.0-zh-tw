@@ -16,6 +16,8 @@ goto :PARSE_ARGS
 
 :ARGS_DONE
 set "ANTIGRAVITY_EXE=%LOCALAPPDATA%\Programs\antigravity\Antigravity.exe"
+if not exist "%ANTIGRAVITY_EXE%" set "ANTIGRAVITY_EXE=%ProgramFiles%\Antigravity\Antigravity.exe"
+if not exist "%ANTIGRAVITY_EXE%" set "ANTIGRAVITY_EXE=%ProgramFiles(x86)%\Antigravity\Antigravity.exe"
 if not exist "%ANTIGRAVITY_EXE%" goto :TRY_NODE
 set "ELECTRON_RUN_AS_NODE=1"
 "%ANTIGRAVITY_EXE%" "%~dp0localization_engine.js" --brand-title english --launch %*

@@ -1402,9 +1402,9 @@ function generateJs(preloadedDict) {
                 } else if (lowerMap.has(valLower)) {
                     newVal = lowerMap.get(valLower);
                 } else if (/^Send message\\s+(Enter|⏎|\\u23ce)$/i.test(valNorm)) {
-                    newVal = (USE_TW ? "發送消息 " : "发送消息 ") + valNorm.replace(/^Send message\\s+/i, '');
+                    newVal = (USE_TW ? "傳送訊息 " : "发送消息 ") + valNorm.replace(/^Send message\\s+/i, '');
                 } else if (/^Queue message\\s+(Enter|⏎|\\u23ce)$/i.test(valNorm)) {
-                    newVal = (USE_TW ? "排隊發送消息 " : "排队发送消息 ") + valNorm.replace(/^Queue message\\s+/i, '');
+                    newVal = (USE_TW ? "排隊傳送訊息 " : "排队发送消息 ") + valNorm.replace(/^Queue message\\s+/i, '');
                 } else if (/^to have the agent generate a plan\\.?$/i.test(valNorm)) {
                     newVal = USE_TW ? "讓代理生成計劃。" : "让智能体生成计划。";
                 } else if ((valNorm === 'Type' || valNorm === 'and select') && node.parentElement && (
@@ -2079,192 +2079,11 @@ function generateJs(preloadedDict) {
         } catch (e) {}
     }
 
-    let mcpSnifferTimer = null;
-    let lastCapturedCount = 0;
-    function scheduleMcpSniffer() {
-        if (mcpSnifferTimer) clearTimeout(mcpSnifferTimer);
-        mcpSnifferTimer = setTimeout(runMcpSniffer, 600);
-    }
-
-    function extractMcpCatalog(screen) {
-        if (!screen) return null;
-        let templates = null;
-        try {
-            const findFiber = (dom) => {
-                if (!dom) return null;
-                const k = Object.keys(dom).find(key => key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$'));
-                return k ? dom[k] : null;
-            };
-
-            const candidates = [
-                screen,
-                screen.querySelector('.divide-y'),
-                screen.querySelector('.divide-y > div')
-            ].filter(Boolean);
-
-            for (const dom of candidates) {
-                let fiber = findFiber(dom);
-                let queue = [fiber];
-                let visited = new Set();
-                let depth = 0;
-                while (queue.length > 0 && depth < 300) {
-                    depth++;
-                    const cur = queue.shift();
-                    if (!cur || visited.has(cur)) continue;
-                    visited.add(cur);
-
-                    if (cur.memoizedProps && Array.isArray(cur.memoizedProps.mcpTemplates) && cur.memoizedProps.mcpTemplates.length > 0) {
-                        templates = cur.memoizedProps.mcpTemplates;
-                        break;
-                    }
-                    if (cur.child) queue.push(cur.child);
-                    if (cur.sibling) queue.push(cur.sibling);
-                    if (cur.return) queue.push(cur.return);
-                }
-                if (templates) break;
-            }
-        } catch (e) {}
-
-        if (!templates || templates.length === 0) {
-            try {
-                const rows = screen.querySelectorAll('.divide-y > div');
-                if (rows && rows.length > 0) {
-                    const domItems = [];
-                    for (const row of rows) {
-                        const titleEl = row.querySelector('a, span.font-medium, .text-sm.font-medium');
-                        const descEl = row.querySelector('.line-clamp-2, .text-xs.text-muted-foreground.mt-1');
-                        const title = titleEl ? (titleEl.childNodes[0]?.textContent || titleEl.textContent || '').trim() : '';
-                        const desc = descEl ? (descEl.textContent || '').trim() : '';
-                        if (title || desc) {
-                            domItems.push({
-                                id: title.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-                                title: title,
-                                description: desc
-                            });
-                        }
-                    }
-                    if (domItems.length > 0) {
-                        templates = domItems;
-                    }
-                }
-            } catch (e) {}
-        }
-
-        return templates;
-    }
-
-    function renderBadge(screen, catalog) {
-        try {
-            if (!screen) return;
-            let badge = document.getElementById('__antigravity_mcp_badge__');
-            const searchRow = screen.querySelector('.relative.flex.items-center');
-            if (!badge && searchRow && searchRow.parentNode) {
-                badge = document.createElement('div');
-                badge.id = '__antigravity_mcp_badge__';
-                badge.className = 'text-xs text-emerald-500 bg-emerald-500/10 border border-emerald-500/30 px-3 py-1.5 rounded flex items-center justify-between cursor-pointer select-none transition-all';
-                badge.style.marginTop = '6px';
-                badge.style.marginBottom = '2px';
-                searchRow.parentNode.insertBefore(badge, searchRow.nextSibling);
-            }
-            if (badge) {
-                const scText = '✓ 已自动捕获 ' + catalog.length + ' 个 MCP 服务器（点击复制 JSON）';
-                const tcText = '✓ 已自動捕獲 ' + catalog.length + ' 個 MCP 伺服器（點擊複製 JSON）';
-                badge.innerHTML = '<span>' + (USE_TW ? tcText : scText) + '</span><span style="opacity:0.75; font-size:11px;">' + (USE_TW ? '點擊複製' : '点击复制') + '</span>';
-                badge.onclick = () => {
-                    try {
-                        navigator.clipboard.writeText(JSON.stringify(catalog, null, 2));
-                        badge.innerHTML = '<span>' + (USE_TW ? '✓ 已複製 JSON 到剪貼簿！' : '✓ 已复制 JSON 到剪贴板！') + '</span>';
-                        setTimeout(() => {
-                            if (badge) badge.innerHTML = '<span>' + (USE_TW ? tcText : scText) + '</span><span style="opacity:0.75; font-size:11px;">' + (USE_TW ? '點擊複製' : '点击复制') + '</span>';
-                        }, 2000);
-                    } catch (err) {}
-                };
-            }
-        } catch (e) {}
-    }
-
-    function runMcpSniffer(retryCount = 0) {
-        try {
-            const screen = document.querySelector('[data-testid="add-mcp-screen"]');
-            if (!screen) return;
-            const items = extractMcpCatalog(screen);
-            if (!items || items.length === 0) {
-                if (retryCount < 12) {
-                    setTimeout(() => runMcpSniffer(retryCount + 1), 500);
-                }
-                return;
-            }
-
-            const catalog = items.map(item => ({
-                id: item.id || '',
-                title: item.title || '',
-                description: item.description || '',
-                link: item.link || '',
-                trustLevel: item.trustLevel || ''
-            }));
-
-            if (catalog.length === lastCapturedCount) {
-                renderBadge(screen, catalog);
-                return;
-            }
-            lastCapturedCount = catalog.length;
-
-            const dumpStr = JSON.stringify(catalog, null, 2);
-
-            try {
-                localStorage.setItem('__antigravity_mcp_dump__', dumpStr);
-            } catch (e) {}
-
-            window.__antigravity_mcp_dump__ = catalog;
-            window.__exportMcpCatalog = function() {
-                console.log(dumpStr);
-                return catalog;
-            };
-
-            try {
-                const req = typeof require === 'function' ? require : null;
-                if (req) {
-                    const fs = req('fs');
-                    const path = req('path');
-                    const os = req('os');
-                    if (fs && path) {
-                        const filePaths = [
-                            'e:/OneDrive/Me/antigravity2-cn/scratch/mcp_catalog_dump.json',
-                            os ? path.join(os.homedir(), '.gemini', 'antigravity', 'mcp_catalog_dump.json') : null
-                        ].filter(Boolean);
-                        for (const fp of filePaths) {
-                            try {
-                                const dir = path.dirname(fp);
-                                if (fs.existsSync(dir)) {
-                                    fs.writeFileSync(fp, dumpStr, 'utf-8');
-                                    console.log('[Antigravity CN] MCP Catalog saved to: ' + fp);
-                                }
-                            } catch (err) {}
-                        }
-                    }
-                }
-            } catch (e) {}
-
-            console.log('%c[Antigravity CN] 已自动捕获 ' + catalog.length + ' 个 MCP 服务器！', 'color: #10b981; font-weight: bold;', catalog);
-            console.log('[Antigravity CN] 如需查看/导出 JSON，可在控制台执行: copy(window.__exportMcpCatalog())');
-
-            renderBadge(screen, catalog);
-        } catch (e) {}
-    }
-
     const observer = new MutationObserver(mutations => {
-        let hasMcpModal = false;
         for (const m of mutations) {
             if (m.type === 'childList') {
                 for (const n of m.addedNodes) {
                     translateNode(n);
-                    if (!hasMcpModal && n.nodeType === 1) {
-                        if (n.getAttribute && n.getAttribute('data-testid') === 'add-mcp-screen') {
-                            hasMcpModal = true;
-                        } else if (n.querySelector && n.querySelector('[data-testid="add-mcp-screen"]')) {
-                            hasMcpModal = true;
-                        }
-                    }
                 }
             } else if (m.type === 'characterData') {
                 translateNode(m.target);
@@ -2274,7 +2093,6 @@ function generateJs(preloadedDict) {
                 }
             }
         }
-        if (hasMcpModal) scheduleMcpSniffer();
     });
 
     const obsOpts = { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['placeholder', 'title', 'aria-label', 'aria-valuetext', 'alt'] };
@@ -2285,9 +2103,6 @@ function generateJs(preloadedDict) {
             try {
                 observeRoot(target);
                 translateNode(target);
-                if (document.querySelector('[data-testid="add-mcp-screen"]')) {
-                    scheduleMcpSniffer();
-                }
             } catch (e) {}
         }
     };
@@ -2323,9 +2138,11 @@ function cleanJsContent(content) {
 }
 
 function cleanMenuJsContent(content) {
-    const startMark = "// ==========================================";
+    if (!content) return content;
+    content = content.replace(/\n?\s*\/\* --- MENU TRANSLATION START --- \*\/[\s\S]*?\/\* --- MENU TRANSLATION END --- \*\//g, '');
+    const legacyStart = "// ==========================================\n    // Antigravity Native Menu Chinese Translation";
     const endMark = "translateMenu(menu.items);";
-    const startIdx = content.indexOf(startMark);
+    const startIdx = content.indexOf(legacyStart);
     const endIdx = content.indexOf(endMark);
     if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {
         return content.substring(0, startIdx) + content.substring(endIdx + endMark.length);
@@ -2961,6 +2778,7 @@ function install20(resourcesDir) {
         console.log(`[修改] 正在向 menu.js 注入選單中文化...`);
         const menuCleaned = cleanMenuJsContent(extracted['dist/menu.js']);
         const menuTranslationJs = `
+    /* --- MENU TRANSLATION START --- */
     // ==========================================
     // Antigravity Native Menu Chinese Translation
     // ==========================================
@@ -3150,6 +2968,7 @@ function install20(resourcesDir) {
         }
     }
     translateMenu(menu.items);
+    /* --- MENU TRANSLATION END --- */
     `;
         const targetStr = "electron_1.Menu.setApplicationMenu(menu);";
         const idx = menuCleaned.indexOf(targetStr);
@@ -3416,7 +3235,7 @@ function restore20(resourcesDir) {
     const asarPath = path.join(resourcesDir, "app.asar");
     const bakPath = path.join(resourcesDir, "app.asar.bak");
 
-    if (IS_AUTO_MODE && checkIfAppIsRunning()) {
+    if (IS_AUTO_MODE && checkIfAppIsRunning(path.dirname(resourcesDir))) {
         console.log(msg("[跳過] 自動模式下偵測到 Antigravity 正在運行，取消還原操作。", "[跳过] 自动模式下检测到 Antigravity 正在运行，取消还原操作。"));
         return false;
     }
@@ -3714,7 +3533,16 @@ function buildUpdateWatchdogVbs() {
         '',
         'Sub WriteWatchdogLog(text)',
         '    On Error Resume Next',
-        '    Dim ts, ls',
+        '    Dim ts, ls, fInfo',
+        '    If fso.FileExists(logPath) Then',
+        '        Set fInfo = fso.GetFile(logPath)',
+        '        If Err.Number = 0 And fInfo.Size > 262144 Then',
+        '            fso.CopyFile logPath, logPath & ".old", True',
+        '            Set ls = fso.OpenTextFile(logPath, 2, True)',
+        '            If Err.Number = 0 Then ls.Close',
+        '        End If',
+        '        Err.Clear',
+        '    End If',
         '    ts = Year(Now) & "-" & Right("0" & Month(Now), 2) & "-" & Right("0" & Day(Now), 2) & " " & Right("0" & Hour(Now), 2) & ":" & Right("0" & Minute(Now), 2) & ":" & Right("0" & Second(Now), 2)',
         '    Set ls = fso.OpenTextFile(logPath, 8, True)',
         '    If Err.Number = 0 Then',
@@ -3723,6 +3551,56 @@ function buildUpdateWatchdogVbs() {
         '    End If',
         '    Err.Clear',
         'End Sub',
+        '',
+        'Function GetAsarStamp(targetAsar)',
+        '    On Error Resume Next',
+        '    GetAsarStamp = ""',
+        '    If Not fso.FileExists(targetAsar) Then Exit Function',
+        '    Dim f',
+        '    Set f = fso.GetFile(targetAsar)',
+        '    If Err.Number = 0 And Not (f Is Nothing) Then',
+        '        GetAsarStamp = CStr(f.Size) & "_" & CStr(f.DateLastModified)',
+        '    End If',
+        '    Err.Clear',
+        'End Function',
+        '',
+        'Function ReadFirstLineAuto(filePath)',
+        '    On Error Resume Next',
+        '    ReadFirstLineAuto = ""',
+        '    If Not fso.FileExists(filePath) Then Exit Function',
+        '    Dim bin, bytes, b1, b2, s, txt',
+        '    Set bin = CreateObject("ADODB.Stream")',
+        '    bin.Type = 1',
+        '    bin.Open',
+        '    bin.LoadFromFile filePath',
+        '    If Err.Number = 0 And Not bin.EOS Then',
+        '        bytes = bin.Read(2)',
+        '        b1 = AscB(MidB(bytes, 1, 1))',
+        '        If LenB(bytes) >= 2 Then b2 = AscB(MidB(bytes, 2, 1)) Else b2 = 0',
+        '        bin.Close',
+        '        If b1 = &HFF And b2 = &HFE Then',
+        '            Set s = fso.OpenTextFile(filePath, 1, False, -1)',
+        '            If Err.Number = 0 And Not s.AtEndOfStream Then ReadFirstLineAuto = Trim(s.ReadLine)',
+        '            If Err.Number = 0 Then s.Close',
+        '        Else',
+        '            Set txt = CreateObject("ADODB.Stream")',
+        '            txt.Type = 2',
+        '            txt.Charset = "utf-8"',
+        '            txt.Open',
+        '            txt.LoadFromFile filePath',
+        '            If Err.Number = 0 And Not txt.EOS Then',
+        '                ReadFirstLineAuto = Trim(Split(Replace(txt.ReadText(-2), vbCr, ""), vbLf)(0))',
+        '            End If',
+        '            If Err.Number = 0 Then txt.Close',
+        '        End If',
+        '    Else',
+        '        Err.Clear',
+        '        Set s = fso.OpenTextFile(filePath, 1, False)',
+        '        If Err.Number = 0 And Not s.AtEndOfStream Then ReadFirstLineAuto = Trim(s.ReadLine)',
+        '        If Err.Number = 0 Then s.Close',
+        '    End If',
+        '    Err.Clear',
+        'End Function',
         '',
         'Dim installDir, oldPid, relaunchFlag',
         'installDir = ""',
@@ -3739,6 +3617,10 @@ function buildUpdateWatchdogVbs() {
         'Do While Right(installDir, 1) = "\\" Or Right(installDir, 1) = "/"',
         '    installDir = Left(installDir, Len(installDir) - 1)',
         'Loop',
+        '',
+        'Dim asarPath, preAsarStamp',
+        'asarPath = installDir & "\\resources\\app.asar"',
+        'preAsarStamp = GetAsarStamp(asarPath)',
         '',
         'Dim wmi',
         'Set wmi = GetObject("winmgmts:\\\\.\\root\\cimv2")',
@@ -3899,12 +3781,16 @@ function buildUpdateWatchdogVbs() {
         'End If',
         '',
         'If Not sawInstaller Then',
-        '    For i = 1 To 20',
+        '    For i = 1 To 90',
         '        If IsInstallerRunning() Then',
         '            sawInstaller = True',
         '            Exit For',
         '        End If',
         '        If HasUpdatedAppInDir(installDir, oldPid) Then',
+        '            sawInstaller = True',
+        '            Exit For',
+        '        End If',
+        '        If preAsarStamp <> "" And GetAsarStamp(asarPath) <> preAsarStamp Then',
         '            sawInstaller = True',
         '            Exit For',
         '        End If',
@@ -3942,32 +3828,26 @@ function buildUpdateWatchdogVbs() {
         '    WScript.Quit 0',
         'End If',
         '',
-        'Dim langArg, langModePath, langStream, langModeVal',
+        'Dim langArg, langModePath, langModeVal',
         'langArg = ""',
         'langModePath = guardDir & "\\lang_mode.txt"',
-        'If fso.FileExists(langModePath) Then',
-        '    Set langStream = fso.OpenTextFile(langModePath, 1, False)',
-        '    If Err.Number = 0 Then',
-        '        If Not langStream.AtEndOfStream Then',
-        '            langModeVal = LCase(Trim(langStream.ReadLine))',
-        '            If langModeVal = "tw" Then',
-        '                langArg = " --tw"',
-        '            ElseIf langModeVal = "cn" Then',
-        '                langArg = " --cn"',
-        '            End If',
-        '        End If',
-        '        langStream.Close',
-        '    End If',
-        '    Err.Clear',
+        'langModeVal = LCase(ReadFirstLineAuto(langModePath))',
+        'If langModeVal = "tw" Then',
+        '    langArg = " --tw"',
+        'ElseIf langModeVal = "cn" Then',
+        '    langArg = " --cn"',
         'End If',
         '',
-        'Dim cmdCheck, cmdPatch, rcCheck, rcPatch, attempt, didTakeover, needRelaunch, completed',
+        'Dim cmdCheck, cmdPatch, rcCheck, rcPatch, attempt, didTakeover, needRelaunch, completed, didPatch, unchangedWaits',
         'didTakeover = False',
         'needRelaunch = (relaunchFlag = "1")',
         'completed = False',
+        'didPatch = False',
+        'unchangedWaits = 0',
         '',
         'For attempt = 1 To 12',
         '    If IsInstallerRunning() Then',
+        '        sawInstaller = True',
         '        WriteWatchdogLog "Attempt " & attempt & ": installer still active; waiting."',
         '        WScript.Sleep 1500',
         '    ElseIf Not fso.FileExists(exePath) Then',
@@ -3981,25 +3861,31 @@ function buildUpdateWatchdogVbs() {
         '        Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
         '',
         '        If rcCheck = 0 Then',
-        '            If (needRelaunch Or didTakeover) And Not HasAppRunningInDir(installDir) Then',
-        '                If fso.FileExists(launchVbsPath) Then',
-        '                    sh.Run """" & wscriptExe & """ //B //Nologo """ & launchVbsPath & """ """ & exePath & """ """ & installDir & """", 0, True',
-        '                Else',
-        '                    sh.Run """" & exePath & """", 1, False',
-        '                End If',
-        '                WriteWatchdogLog "Verified localized on attempt " & attempt & "; launched Antigravity GUI."',
+        '            If Not didPatch And Not sawInstaller And preAsarStamp <> "" And GetAsarStamp(asarPath) = preAsarStamp And unchangedWaits < 5 Then',
+        '                WriteWatchdogLog "Attempt " & attempt & ": ASAR unchanged since pre-update; waiting for installer."',
+        '                unchangedWaits = unchangedWaits + 1',
+        '                WScript.Sleep 2000',
         '            Else',
-        '                WriteWatchdogLog "Verified localized on attempt " & attempt & "; already running or no launch needed."',
+        '                If (needRelaunch Or didTakeover) And Not HasAppRunningInDir(installDir) Then',
+        '                    If fso.FileExists(launchVbsPath) Then',
+        '                        sh.Run """" & wscriptExe & """ //B //Nologo """ & launchVbsPath & """ """ & exePath & """ """ & installDir & """", 0, True',
+        '                    Else',
+        '                        sh.Run """" & exePath & """", 1, False',
+        '                    End If',
+        '                    WriteWatchdogLog "Verified localized on attempt " & attempt & "; launched Antigravity GUI."',
+        '                Else',
+        '                    WriteWatchdogLog "Verified localized on attempt " & attempt & "; already running or no launch needed."',
+        '                End If',
+        '                WScript.Sleep 1500',
+        '                sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
+        '                rcCheck = sh.Run(cmdCheck, 0, True)',
+        '                Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '                If rcCheck = 0 Then',
+        '                    completed = True',
+        '                    Exit For',
+        '                End If',
+        '                WriteWatchdogLog "Post-launch verification detected reversion; retrying localization."',
         '            End If',
-        '            WScript.Sleep 1500',
-        '            sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
-        '            rcCheck = sh.Run(cmdCheck, 0, True)',
-        '            Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
-        '            If rcCheck = 0 Then',
-        '                completed = True',
-        '                Exit For',
-        '            End If',
-        '            WriteWatchdogLog "Post-launch verification detected reversion; retrying localization."',
         '        ElseIf rcCheck = 10 Then',
         '            If HasAppRunningInDir(installDir) Then',
         '                didTakeover = True',
@@ -4015,6 +3901,7 @@ function buildUpdateWatchdogVbs() {
         '                WriteWatchdogLog "Attempt " & attempt & ": patch returned rc=" & rcPatch & "; retrying."',
         '                WScript.Sleep 1500',
         '            Else',
+        '                didPatch = True',
         '                WScript.Sleep 400',
         '            End If',
         '        Else',
