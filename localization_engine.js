@@ -2411,7 +2411,8 @@ function isUpdaterProcessRecord(proc) {
     const name = String(proc.Name || '').toLowerCase();
     const exePath = String(proc.ExecutablePath || '').toLowerCase();
     const cmdLine = String(proc.CommandLine || '').toLowerCase();
-    if (name === 'antigravity-x64.exe' || name === 'antigravity-arm64.exe') return true;
+    if (name === 'antigravity-x64.exe' || name === 'antigravity-arm64.exe' || name === 'uninstall antigravity.exe') return true;
+    if (name === 'old-uninstaller.exe' && (exePath.includes('antigravity') || cmdLine.includes('keep_app_data') || cmdLine.includes('antigravity'))) return true;
     if (name === 'installer.exe' && (exePath.includes('antigravity-updater') || cmdLine.includes('antigravity'))) return true;
     if (name === 'elevate.exe' && (exePath.includes('antigravity') || cmdLine.includes('antigravity'))) return true;
     if (/^au_.*\.exe$/i.test(name) && (cmdLine.includes('keep_app_data') || cmdLine.includes('antigravity'))) return true;
@@ -2458,9 +2459,9 @@ function getRunningStatus(targetInstallDir) {
                 const pid = parseInt(parts[1].replace(/"/g, '').trim(), 10);
                 if (imgName === 'antigravity.exe' && !isNaN(pid) && pid !== selfPid) {
                     candidateAppPids.push(pid);
-                } else if (imgName === 'antigravity-x64.exe' || imgName === 'antigravity-arm64.exe') {
+                } else if (imgName === 'antigravity-x64.exe' || imgName === 'antigravity-arm64.exe' || imgName === 'uninstall antigravity.exe') {
                     hasDirectInstallerImg = true;
-                } else if (imgName === 'installer.exe' || imgName === 'elevate.exe' || /^au_.*\.exe$/i.test(imgName)) {
+                } else if (imgName === 'installer.exe' || imgName === 'elevate.exe' || imgName === 'old-uninstaller.exe' || /^au_.*\.exe$/i.test(imgName)) {
                     hasInspectableUpdaterImg = true;
                 }
             }
@@ -2468,7 +2469,7 @@ function getRunningStatus(targetInstallDir) {
 
             const queryNames = [];
             if (candidateAppPids.length > 0) queryNames.push('Antigravity.exe');
-            if (hasInspectableUpdaterImg && !updaterRunning) queryNames.push('installer.exe', 'elevate.exe', 'Au_.exe');
+            if (hasInspectableUpdaterImg && !updaterRunning) queryNames.push('installer.exe', 'elevate.exe', 'old-uninstaller.exe', 'Au_.exe');
 
             const targetDirLower = targetInstallDir ? normalizeWinPathLower(targetInstallDir) : '';
             if (queryNames.length > 0) {
@@ -3840,7 +3841,7 @@ function buildUpdateWatchdogVbs() {
         'End Function',
         '',
         'Function IsInstallerRunning()',
-        '    IsInstallerRunning = IsProcessRunning("Antigravity-x64.exe") Or IsProcessRunning("Antigravity-arm64.exe")',
+        '    IsInstallerRunning = IsProcessRunning("Antigravity-x64.exe") Or IsProcessRunning("Antigravity-arm64.exe") Or IsProcessRunning("Uninstall Antigravity.exe")',
         '    If IsInstallerRunning Then Exit Function',
         '    Dim col, item, ep, cl',
         '    Err.Clear',
@@ -3864,11 +3865,12 @@ function buildUpdateWatchdogVbs() {
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name LIKE \'Au_%.exe\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'old-uninstaller.exe\' OR Name LIKE \'Au_%.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
+        '            If IsNull(item.ExecutablePath) Then ep = "" Else ep = LCase(CStr(item.ExecutablePath))',
         '            If IsNull(item.CommandLine) Then cl = "" Else cl = LCase(CStr(item.CommandLine))',
-        '            If InStr(1, cl, "keep_app_data", 1) > 0 Or InStr(1, cl, "antigravity", 1) > 0 Then',
+        '            If InStr(1, ep, "antigravity", 1) > 0 Or InStr(1, cl, "keep_app_data", 1) > 0 Or InStr(1, cl, "antigravity", 1) > 0 Then',
         '                IsInstallerRunning = True',
         '                Exit Function',
         '            End If',
@@ -4064,7 +4066,7 @@ function buildGuardVbs() {
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'Antigravity-x64.exe\' OR Name=\'Antigravity-arm64.exe\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'Antigravity-x64.exe\' OR Name=\'Antigravity-arm64.exe\' OR Name=\'Uninstall Antigravity.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
         '            WScript.Quit 0',
@@ -4089,11 +4091,12 @@ function buildGuardVbs() {
         '        Next',
         '    End If',
         '    Err.Clear',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name LIKE \'Au_%.exe\'")',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'old-uninstaller.exe\' OR Name LIKE \'Au_%.exe\'")',
         '    If Err.Number = 0 Then',
         '        For Each item In col',
+        '            If IsNull(item.ExecutablePath) Then epVal = "" Else epVal = LCase(CStr(item.ExecutablePath))',
         '            If IsNull(item.CommandLine) Then cmdVal = "" Else cmdVal = LCase(CStr(item.CommandLine))',
-        '            If InStr(1, cmdVal, "keep_app_data", 1) > 0 Or InStr(1, cmdVal, "antigravity", 1) > 0 Then',
+        '            If InStr(1, epVal, "antigravity", 1) > 0 Or InStr(1, cmdVal, "keep_app_data", 1) > 0 Or InStr(1, cmdVal, "antigravity", 1) > 0 Then',
         '                WScript.Quit 0',
         '            End If',
         '        Next',
@@ -4108,38 +4111,59 @@ function buildGuardVbs() {
         'End If',
         'Err.Clear',
         '',
-        'Dim installDir, cfgPath, cfgStream, exePath, enginePath',
-        'installDir = ""',
-        'cfgPath = guardDir & "\\install_dir.txt"',
-        'If fso.FileExists(cfgPath) Then',
-        '    Set cfgStream = fso.OpenTextFile(cfgPath, 1, False)',
-        '    If Err.Number = 0 Then',
-        '        If Not cfgStream.AtEndOfStream Then installDir = Trim(cfgStream.ReadLine)',
-        '        cfgStream.Close',
+        'Function ReadFirstLineAuto(filePath)',
+        '    On Error Resume Next',
+        '    ReadFirstLineAuto = ""',
+        '    If Not fso.FileExists(filePath) Then Exit Function',
+        '    Dim bin, bytes, b1, b2, s, txt',
+        '    Set bin = CreateObject("ADODB.Stream")',
+        '    bin.Type = 1',
+        '    bin.Open',
+        '    bin.LoadFromFile filePath',
+        '    If Err.Number = 0 And Not bin.EOS Then',
+        '        bytes = bin.Read(2)',
+        '        b1 = AscB(MidB(bytes, 1, 1))',
+        '        If LenB(bytes) >= 2 Then b2 = AscB(MidB(bytes, 2, 1)) Else b2 = 0',
+        '        bin.Close',
+        '        If b1 = &HFF And b2 = &HFE Then',
+        '            Set s = fso.OpenTextFile(filePath, 1, False, -1)',
+        '            If Err.Number = 0 And Not s.AtEndOfStream Then ReadFirstLineAuto = Trim(s.ReadLine)',
+        '            If Err.Number = 0 Then s.Close',
+        '        Else',
+        '            Set txt = CreateObject("ADODB.Stream")',
+        '            txt.Type = 2',
+        '            txt.Charset = "utf-8"',
+        '            txt.Open',
+        '            txt.LoadFromFile filePath',
+        '            If Err.Number = 0 And Not txt.EOS Then',
+        '                ReadFirstLineAuto = Trim(Split(Replace(txt.ReadText(-2), vbCr, ""), vbLf)(0))',
+        '            End If',
+        '            If Err.Number = 0 Then txt.Close',
+        '        End If',
+        '    Else',
+        '        Err.Clear',
+        '        Set s = fso.OpenTextFile(filePath, 1, False)',
+        '        If Err.Number = 0 And Not s.AtEndOfStream Then ReadFirstLineAuto = Trim(s.ReadLine)',
+        '        If Err.Number = 0 Then s.Close',
         '    End If',
         '    Err.Clear',
-        'End If',
+        'End Function',
+        '',
+        'Dim installDir, cfgPath, exePath, enginePath',
+        'cfgPath = guardDir & "\\install_dir.txt"',
+        'installDir = ReadFirstLineAuto(cfgPath)',
         'If installDir = "" Then',
         '    installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
         'End If',
         '',
-        'Dim langArg, langModePath, langStream, langModeVal',
+        'Dim langArg, langModePath, langModeVal',
         'langArg = ""',
         'langModePath = guardDir & "\\lang_mode.txt"',
-        'If fso.FileExists(langModePath) Then',
-        '    Set langStream = fso.OpenTextFile(langModePath, 1, False)',
-        '    If Err.Number = 0 Then',
-        '        If Not langStream.AtEndOfStream Then',
-        '            langModeVal = LCase(Trim(langStream.ReadLine))',
-        '            If langModeVal = "tw" Then',
-        '                langArg = " --tw"',
-        '            ElseIf langModeVal = "cn" Then',
-        '                langArg = " --cn"',
-        '            End If',
-        '        End If',
-        '        langStream.Close',
-        '    End If',
-        '    Err.Clear',
+        'langModeVal = LCase(ReadFirstLineAuto(langModePath))',
+        'If langModeVal = "tw" Then',
+        '    langArg = " --tw"',
+        'ElseIf langModeVal = "cn" Then',
+        '    langArg = " --cn"',
         'End If',
         '',
         'exePath = installDir & "\\Antigravity.exe"',
@@ -4277,8 +4301,9 @@ function installAutoGuard(installDir) {
             }
         }
 
-        // 2. 寫入安裝目錄、語系模式設定與純 ASCII VBS 守衛/看門狗/啟動輔助腳本
-        fs.writeFileSync(path.join(guardDir, 'install_dir.txt'), installDir + '\r\n', 'utf8');
+        // 2. 寫入安裝目錄（UTF-16LE BOM 支援任意繁簡中路徑）、語系模式設定與純 ASCII VBS 守衛/看門狗/啟動輔助腳本
+        const installDirBuf = Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from(installDir + '\r\n', 'utf16le')]);
+        fs.writeFileSync(path.join(guardDir, 'install_dir.txt'), installDirBuf);
         fs.writeFileSync(path.join(guardDir, 'lang_mode.txt'), LANG_SELECTION_MODE + '\r\n', 'utf8');
         fs.writeFileSync(path.join(guardDir, 'launch_gui.vbs'), buildLaunchGuiVbs(), 'utf8');
         fs.writeFileSync(path.join(guardDir, 'update_watchdog.vbs'), buildUpdateWatchdogVbs(), 'utf8');
