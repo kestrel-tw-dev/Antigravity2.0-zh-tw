@@ -17,7 +17,7 @@
 
 ## 三步驟超簡單安裝
 
-1. **下載成品壓縮包**：前往右側 [**Releases**](https://github.com/kestrel-tw-dev/Antigravity2.0-zh-tw/releases/latest) 頁面，或點擊直接下載最新版 [**`Antigravity2.0-zh-tw-v2.35.2.zip`**](https://github.com/kestrel-tw-dev/Antigravity2.0-zh-tw/releases/latest/download/Antigravity2.0-zh-tw-v2.35.2.zip) 並解壓縮到任意位置。
+1. **下載成品壓縮包**：前往右側 [**Releases**](https://github.com/kestrel-tw-dev/Antigravity2.0-zh-tw/releases/latest) 頁面，或點擊直接下載最新版 [**`Antigravity2.0-zh-tw-v2.36.0.zip`**](https://github.com/kestrel-tw-dev/Antigravity2.0-zh-tw/releases/latest/download/Antigravity2.0-zh-tw-v2.36.0.zip) 並解壓縮到任意位置。
 2. **點兩下打開** **`Start.bat`**。
 3. **等約 1～2 秒鐘**，視窗會自動完成中文化、打開 **中文版 Antigravity** ！
 

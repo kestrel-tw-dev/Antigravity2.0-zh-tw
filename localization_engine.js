@@ -323,8 +323,11 @@ const IS_CHECK_ONLY = process.argv.includes('--check');
 const IS_INSTALL_GUARD = process.argv.includes('--install-guard');
 const IS_UNINSTALL_GUARD = process.argv.includes('--uninstall-guard');
 const IS_NO_GUARD = process.argv.includes('--no-guard');
+const IS_TAKEOVER_POST_UPDATE = process.argv.includes('--takeover-post-update');
+const IS_CHECK_PATCH_NEEDED = process.argv.includes('--check-patch-needed');
 
 const UPDATER_HOOK_START = "/* --- ANTIGRAVITY UPDATE AUTO-DETECT HOOK START --- */";
+const UPDATER_HOOK_VERSION_MARKER = "/* TW-GUARD-V2 */";
 const UPDATER_HOOK_END = "/* --- ANTIGRAVITY UPDATE AUTO-DETECT HOOK END --- */";
 const GUARD_DIR_NAME = "antigravity-localization";
 const GUARD_TASK_NAME = "Antigravity_AutoGuard";
@@ -2343,7 +2346,7 @@ function cleanUpdaterJsContent(content) {
 
 function inspectAsarStatus(asarPath) {
     if (!asarPath || !fs.existsSync(asarPath)) {
-        return { valid: false, reason: 'missing', version: null, isLocalized: false, hasUpdaterHook: false, installedLang: null };
+        return { valid: false, reason: 'missing', version: null, isLocalized: false, hasUpdaterHook: false, hasLatestUpdaterHook: false, installedLang: null };
     }
     try {
         const files = readFilesFromAsar(asarPath, ['dist/preload.js', 'dist/updater.js', 'package.json']);
@@ -2351,19 +2354,22 @@ function inspectAsarStatus(asarPath) {
         const updater = files['dist/updater.js'];
         const pkgStr = files['package.json'];
         if (typeof preload !== 'string' || preload.length === 0 || typeof pkgStr !== 'string' || pkgStr.length === 0) {
-            return { valid: false, reason: 'corrupt_or_incomplete', version: null, isLocalized: false, hasUpdaterHook: false, installedLang: null };
+            return { valid: false, reason: 'corrupt_or_incomplete', version: null, isLocalized: false, hasUpdaterHook: false, hasLatestUpdaterHook: false, installedLang: null };
         }
         const pkg = JSON.parse(pkgStr);
         const version = pkg && typeof pkg.version === 'string' ? pkg.version : '';
         if (!version) {
-            return { valid: false, reason: 'missing_version', version: null, isLocalized: false, hasUpdaterHook: false, installedLang: null };
+            return { valid: false, reason: 'missing_version', version: null, isLocalized: false, hasUpdaterHook: false, hasLatestUpdaterHook: false, installedLang: null };
         }
         const isLocalized = preload.includes(SIGNATURE_START);
         const installedLang = isLocalized ? (preload.includes('const USE_TW = true;') ? 'tw' : 'cn') : null;
         const hasUpdaterHook = typeof updater === 'string' ? updater.includes(UPDATER_HOOK_START) : true;
-        return { valid: true, reason: 'ok', version, isLocalized, hasUpdaterHook, installedLang };
+        const hasLatestUpdaterHook = typeof updater === 'string'
+            ? (updater.includes(UPDATER_HOOK_START) && updater.includes(UPDATER_HOOK_VERSION_MARKER))
+            : true;
+        return { valid: true, reason: 'ok', version, isLocalized, hasUpdaterHook, hasLatestUpdaterHook, installedLang };
     } catch (e) {
-        return { valid: false, reason: e.message || 'read_error', version: null, isLocalized: false, hasUpdaterHook: false, installedLang: null };
+        return { valid: false, reason: e.message || 'read_error', version: null, isLocalized: false, hasUpdaterHook: false, hasLatestUpdaterHook: false, installedLang: null };
     }
 }
 
@@ -2373,12 +2379,66 @@ function escapeRegExp(string) {
 
 let wasAppRunning = false;
 
-function getRunningStatus() {
+function normalizeWinPathLower(p) {
+    if (!p || typeof p !== 'string') return '';
+    return path.resolve(p).toLowerCase().replace(/[\\/]+$/, '');
+}
+
+function queryWin32ProcessDetails(imageNames) {
+    if (process.platform !== 'win32' || !Array.isArray(imageNames) || imageNames.length === 0) return null;
+    try {
+        const wqlFilter = imageNames.map(n => `Name='${String(n).replace(/'/g, '')}'`).join(' OR ');
+        const psCmd = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $p=@(Get-CimInstance Win32_Process -Filter "${wqlFilter}" -ErrorAction SilentlyContinue | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine); if($p.Count -gt 0){$p | ConvertTo-Json -Compress}else{'[]'}`;
+        const sysRoot = process.env.SystemRoot || 'C:\\Windows';
+        const psExe = path.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+        const exe = fs.existsSync(psExe) ? psExe : 'powershell.exe';
+        const out = child_process.execFileSync(exe, ['-NoProfile', '-NonInteractive', '-Command', psCmd], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true,
+            timeout: 8000
+        }).trim();
+        if (!out) return [];
+        const parsed = JSON.parse(out);
+        return Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+    } catch (_) {
+        return null;
+    }
+}
+
+function isUpdaterProcessRecord(proc) {
+    if (!proc) return false;
+    const name = String(proc.Name || '').toLowerCase();
+    const exePath = String(proc.ExecutablePath || '').toLowerCase();
+    const cmdLine = String(proc.CommandLine || '').toLowerCase();
+    if (name === 'antigravity-x64.exe' || name === 'antigravity-arm64.exe') return true;
+    if (name === 'installer.exe' && (exePath.includes('antigravity-updater') || cmdLine.includes('antigravity'))) return true;
+    if (name === 'elevate.exe' && (exePath.includes('antigravity') || cmdLine.includes('antigravity'))) return true;
+    if (/^au_.*\.exe$/i.test(name) && (cmdLine.includes('keep_app_data') || cmdLine.includes('antigravity'))) return true;
+    return false;
+}
+
+function isAppProcessInDir(proc, targetDirLower, selfPid) {
+    if (!proc) return false;
+    const pid = Number(proc.ProcessId);
+    if (!pid || pid === selfPid) return false;
+    const cmdLine = String(proc.CommandLine || '').toLowerCase();
+    if (cmdLine.includes('localization_engine.js')) return false;
+    const exePath = normalizeWinPathLower(proc.ExecutablePath || '');
+    if (!targetDirLower) return true;
+    if (exePath) {
+        return exePath === `${targetDirLower}\\antigravity.exe` || exePath.startsWith(`${targetDirLower}\\`);
+    }
+    return cmdLine.includes(targetDirLower) || cmdLine.includes('--updated');
+}
+
+function getRunningStatus(targetInstallDir) {
     if (process.env.AG_SKIP_PROC_CHECK === '1') {
-        return { appRunning: false, updaterRunning: false };
+        return { appRunning: false, updaterRunning: false, appPids: [] };
     }
     let appRunning = false;
     let updaterRunning = false;
+    const appPids = [];
     try {
         const selfPid = process.pid;
         if (process.platform === 'win32') {
@@ -2387,6 +2447,9 @@ function getRunningStatus() {
                 stdio: ['ignore', 'pipe', 'ignore'],
                 windowsHide: true
             });
+            const candidateAppPids = [];
+            let hasDirectInstallerImg = false;
+            let hasInspectableUpdaterImg = false;
             for (const line of stdout.split(/\r?\n/)) {
                 if (!line.trim()) continue;
                 const parts = line.split('","');
@@ -2394,9 +2457,37 @@ function getRunningStatus() {
                 const imgName = parts[0].replace(/^"/, '').trim().toLowerCase();
                 const pid = parseInt(parts[1].replace(/"/g, '').trim(), 10);
                 if (imgName === 'antigravity.exe' && !isNaN(pid) && pid !== selfPid) {
-                    appRunning = true;
+                    candidateAppPids.push(pid);
                 } else if (imgName === 'antigravity-x64.exe' || imgName === 'antigravity-arm64.exe') {
-                    updaterRunning = true;
+                    hasDirectInstallerImg = true;
+                } else if (imgName === 'installer.exe' || imgName === 'elevate.exe' || /^au_.*\.exe$/i.test(imgName)) {
+                    hasInspectableUpdaterImg = true;
+                }
+            }
+            if (hasDirectInstallerImg) updaterRunning = true;
+
+            const queryNames = [];
+            if (candidateAppPids.length > 0) queryNames.push('Antigravity.exe');
+            if (hasInspectableUpdaterImg && !updaterRunning) queryNames.push('installer.exe', 'elevate.exe', 'Au_.exe');
+
+            const targetDirLower = targetInstallDir ? normalizeWinPathLower(targetInstallDir) : '';
+            if (queryNames.length > 0) {
+                const details = queryWin32ProcessDetails(queryNames);
+                if (Array.isArray(details)) {
+                    for (const proc of details) {
+                        const name = String(proc.Name || '').toLowerCase();
+                        if (name === 'antigravity.exe') {
+                            if (isAppProcessInDir(proc, targetDirLower, selfPid)) {
+                                appRunning = true;
+                                appPids.push(Number(proc.ProcessId));
+                            }
+                        } else if (!updaterRunning && isUpdaterProcessRecord(proc)) {
+                            updaterRunning = true;
+                        }
+                    }
+                } else if (candidateAppPids.length > 0) {
+                    appRunning = true;
+                    appPids.push(...candidateAppPids);
                 }
             }
         } else if (process.platform === 'darwin') {
@@ -2406,11 +2497,11 @@ function getRunningStatus() {
     } catch (e) {
         // ignore
     }
-    return { appRunning, updaterRunning };
+    return { appRunning, updaterRunning, appPids };
 }
 
-function checkIfAppIsRunning() {
-    const st = getRunningStatus();
+function checkIfAppIsRunning(targetInstallDir) {
+    const st = getRunningStatus(targetInstallDir);
     return st.appRunning || st.updaterRunning;
 }
 
@@ -2423,21 +2514,64 @@ function sleepMs(ms) {
     }
 }
 
-function closeAntigravityProcesses() {
+function closeAntigravityProcesses(options = {}) {
     const selfPid = process.pid;
+    const targetInstallDir = options && options.installDir ? String(options.installDir) : '';
+    const waitMs = (options && options.waitForExitMs) || 8000;
     let closedAny = false;
     try {
         if (process.platform === 'win32') {
-            const targetImage = process.env.AG_TEST_TARGET_IMAGE || 'Antigravity.exe';
-            const listPids = () => {
+            const targetImage = process.env.AG_TEST_TARGET_IMAGE || '';
+            const targetDirLower = targetInstallDir ? normalizeWinPathLower(targetInstallDir) : '';
+
+            const listTargetPids = () => {
+                if (targetImage) {
+                    try {
+                        const out = child_process.execSync(`tasklist /fi "imagename eq ${targetImage}" /fo csv /nh`, {
+                            encoding: 'utf8',
+                            stdio: ['ignore', 'pipe', 'ignore'],
+                            windowsHide: true
+                        });
+                        return out.split(/\r?\n/)
+                            .filter(l => l.toLowerCase().includes(targetImage.toLowerCase()))
+                            .map(l => parseInt(l.split('","')[1]?.replace(/"/g, '')?.trim(), 10))
+                            .filter(pid => !isNaN(pid) && pid > 0 && pid !== selfPid);
+                    } catch (_) {
+                        return [];
+                    }
+                }
+
+                const details = queryWin32ProcessDetails(['Antigravity.exe', 'language_server.exe']);
+                if (Array.isArray(details)) {
+                    const matched = [];
+                    for (const proc of details) {
+                        const pid = Number(proc.ProcessId);
+                        if (!pid || pid === selfPid) continue;
+                        const cmdLine = String(proc.CommandLine || '').toLowerCase();
+                        if (cmdLine.includes('localization_engine.js')) continue;
+                        const name = String(proc.Name || '').toLowerCase();
+                        const exePath = normalizeWinPathLower(proc.ExecutablePath || '');
+                        if (name === 'antigravity.exe') {
+                            if (isAppProcessInDir(proc, targetDirLower, selfPid)) {
+                                matched.push(pid);
+                            }
+                        } else if (name === 'language_server.exe') {
+                            if (!targetDirLower || (exePath && exePath.startsWith(`${targetDirLower}\\`))) {
+                                matched.push(pid);
+                            }
+                        }
+                    }
+                    return matched;
+                }
+
                 try {
-                    const out = child_process.execSync(`tasklist /fi "imagename eq ${targetImage}" /fo csv /nh`, {
+                    const out = child_process.execSync('tasklist /fi "imagename eq Antigravity.exe" /fo csv /nh', {
                         encoding: 'utf8',
                         stdio: ['ignore', 'pipe', 'ignore'],
                         windowsHide: true
                     });
                     return out.split(/\r?\n/)
-                        .filter(l => l.toLowerCase().includes(targetImage.toLowerCase()))
+                        .filter(l => l.toLowerCase().includes('antigravity.exe'))
                         .map(l => parseInt(l.split('","')[1]?.replace(/"/g, '')?.trim(), 10))
                         .filter(pid => !isNaN(pid) && pid > 0 && pid !== selfPid);
                 } catch (_) {
@@ -2445,7 +2579,7 @@ function closeAntigravityProcesses() {
                 }
             };
 
-            const pids = listPids();
+            let pids = listTargetPids();
             if (pids.length === 0) return false;
 
             closedAny = true;
@@ -2455,16 +2589,24 @@ function closeAntigravityProcesses() {
             ));
             for (const pid of pids) {
                 try {
-                    child_process.execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore', windowsHide: true });
+                    child_process.execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore', windowsHide: true });
                 } catch (_) {}
             }
 
-            // 輪詢最多 5 秒直到所有外部進程完全退出
-            for (let i = 0; i < 25; i++) {
+            const maxLoops = Math.max(10, Math.ceil(waitMs / 200));
+            for (let i = 0; i < maxLoops; i++) {
                 sleepMs(200);
-                if (listPids().length === 0) break;
+                pids = listTargetPids();
+                if (pids.length === 0) break;
+                if (i % 5 === 4) {
+                    for (const pid of pids) {
+                        try {
+                            child_process.execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore', windowsHide: true });
+                        } catch (_) {}
+                    }
+                }
             }
-            sleepMs(300);
+            sleepMs(450);
             console.log(msg(
                 `[關閉] Antigravity 已完全關閉，檔案鎖定已解除。`,
                 `[关闭] Antigravity 已完全关闭，文件锁定已解除。`
@@ -2733,7 +2875,7 @@ function install20(resourcesDir) {
         IS_IF_NEEDED &&
         asarStatus.isLocalized &&
         asarStatus.installedLang === targetLang &&
-        (process.platform !== 'win32' || IS_NO_GUARD || asarStatus.hasUpdaterHook)
+        (process.platform !== 'win32' || IS_NO_GUARD || asarStatus.hasLatestUpdaterHook)
     ) {
         console.log(msg(
             `[略過] 目前版本 (${asarStatus.version}) 已包含完整${langDisplay}漢化與更新自動偵測引擎。`,
@@ -3097,30 +3239,37 @@ function install20(resourcesDir) {
 
         const updaterHookBody = String.raw`
 /* --- ANTIGRAVITY UPDATE AUTO-DETECT HOOK START --- */
+/* TW-GUARD-V2 */
 ;(function () {
     try {
         const _fs = require('fs');
         const _path = require('path');
+        const _os = require('os');
         const _cp = require('child_process');
         let _watchdogSpawned = false;
-        function _spawnLocalizationUpdateWatchdog(isSilentMode) {
-            if (_watchdogSpawned || process.platform !== 'win32') return;
+        function _appendHookLog(guardDir, text) {
+            try {
+                if (!_fs.existsSync(guardDir)) return;
+                const ts = new Date().toISOString();
+                _fs.appendFileSync(_path.join(guardDir, 'guard.log'), '[' + ts + '] [HOOK] ' + text + '\n', 'utf8');
+            } catch (_e) {}
+        }
+        function _spawnLocalizationUpdateWatchdog(isSilentMode, shouldAutoRelaunch) {
+            if (_watchdogSpawned || process.platform !== 'win32') return false;
             const updaterObj = electron_updater_1 && electron_updater_1.autoUpdater;
-            if (!updaterObj || !updaterObj.installerPath) return;
-            const localAppData = process.env.LOCALAPPDATA;
-            if (!localAppData) return;
+            if (!updaterObj || !updaterObj.installerPath) return false;
+            const localAppData = process.env.LOCALAPPDATA || _path.join(_os.homedir(), 'AppData', 'Local');
+            if (!localAppData) return false;
             const guardDir = _path.join(localAppData, 'antigravity-localization');
             const enginePath = _path.join(guardDir, 'localization_engine.js');
             const watchdogVbs = _path.join(guardDir, 'update_watchdog.vbs');
-            if (!_fs.existsSync(enginePath) || !_fs.existsSync(watchdogVbs)) return;
+            if (!_fs.existsSync(enginePath) || !_fs.existsSync(watchdogVbs)) return false;
             const sysRoot = process.env.SystemRoot || 'C:\\Windows';
             let wscriptExe = _path.join(sysRoot, 'System32', 'wscript.exe');
             if (!_fs.existsSync(wscriptExe)) wscriptExe = 'wscript.exe';
             const installDir = _path.dirname(process.execPath);
-            let shouldAutoRelaunch = false;
             if (!isSilentMode) {
                 updaterObj.autoRunAppAfterInstall = false;
-                shouldAutoRelaunch = true;
             }
             const vbsArgs = ['//B', '//Nologo', watchdogVbs, installDir, String(process.pid), shouldAutoRelaunch ? '1' : '0'];
             const envCopy = Object.assign({}, process.env);
@@ -3135,13 +3284,27 @@ function install20(resourcesDir) {
             });
             if (child && typeof child.unref === 'function') child.unref();
             _watchdogSpawned = true;
-            console.log('[AutoUpdater][TW-Guard] Post-update localization watchdog armed (relaunch=' + shouldAutoRelaunch + ')');
+            _appendHookLog(guardDir, 'Watchdog armed (pid=' + process.pid + ', silent=' + isSilentMode + ', relaunch=' + shouldAutoRelaunch + ')');
+            console.log('[AutoUpdater][TW-Guard] Post-update localization watchdog armed (relaunch=' + shouldAutoRelaunch + ', silent=' + isSilentMode + ')');
+            return true;
         }
         if (electron_updater_1 && electron_updater_1.autoUpdater && typeof electron_updater_1.autoUpdater.quitAndInstall === 'function') {
             const _origQuitAndInstall = electron_updater_1.autoUpdater.quitAndInstall.bind(electron_updater_1.autoUpdater);
             electron_updater_1.autoUpdater.quitAndInstall = function (isSilent, isForceRunAfter) {
-                try { _spawnLocalizationUpdateWatchdog(Boolean(isSilent)); } catch (_e) {}
-                return _origQuitAndInstall(isSilent, isForceRunAfter);
+                const silentFlag = Boolean(isSilent);
+                const shouldAutoRelaunch = !silentFlag || Boolean(isForceRunAfter);
+                const effectiveForceRun = (silentFlag && isForceRunAfter) ? false : isForceRunAfter;
+                let spawned = false;
+                try {
+                    spawned = _spawnLocalizationUpdateWatchdog(silentFlag, shouldAutoRelaunch);
+                } catch (_e) {}
+                const res = _origQuitAndInstall(isSilent, effectiveForceRun);
+                try {
+                    if (spawned && electron_updater_1.autoUpdater && !electron_updater_1.autoUpdater.quitAndInstallCalled) {
+                        setTimeout(function () { _watchdogSpawned = false; }, 1000);
+                    }
+                } catch (_e) {}
+                return res;
             };
         }
     } catch (_err) {}
@@ -3182,23 +3345,42 @@ function install20(resourcesDir) {
         replacements['dist/main.js'] = mainContent;
     }
 
-    // 4. 手術式重新封裝 ASAR（優先原子替換，自動模式嚴禁熱覆寫）
+    // 4. 手術式重新封裝 ASAR（優先原子替換，自動／接管模式嚴禁熱覆寫）
     console.log(msg(`[封裝] 正在應用手術式增量封裝寫入 app.asar...`, `[封装] 正在应用手术式增量封装写入 app.asar...`));
     const tempAsarPath = asarPath + '.tmp.' + process.pid;
     let hotOverwritten = false;
     try {
         surgicalPatchAsar(sourceAsarPath, tempAsarPath, replacements);
-        try {
-            fs.renameSync(tempAsarPath, asarPath);
-        } catch (renameErr) {
-            const isLockErr = renameErr && (renameErr.code === 'EPERM' || renameErr.code === 'EBUSY' || renameErr.code === 'EACCES');
-            if (!isLockErr) {
-                throw renameErr;
+        const installDirFromRes = path.dirname(resourcesDir);
+        const maxRenameTries = IS_AUTO_MODE ? 1 : (IS_TAKEOVER_POST_UPDATE ? 10 : 5);
+        let renamed = false;
+        let lastRenameErr = null;
+        for (let attempt = 1; attempt <= maxRenameTries; attempt++) {
+            try {
+                fs.renameSync(tempAsarPath, asarPath);
+                renamed = true;
+                break;
+            } catch (renameErr) {
+                lastRenameErr = renameErr;
+                const isLockErr = renameErr && (renameErr.code === 'EPERM' || renameErr.code === 'EBUSY' || renameErr.code === 'EACCES');
+                if (!isLockErr || attempt === maxRenameTries) {
+                    break;
+                }
+                if (IS_TAKEOVER_POST_UPDATE) {
+                    closeAntigravityProcesses({ installDir: installDirFromRes, waitForExitMs: 5000 });
+                }
+                sleepMs(400);
             }
-            if (IS_AUTO_MODE) {
+        }
+        if (!renamed) {
+            const isLockErr = lastRenameErr && (lastRenameErr.code === 'EPERM' || lastRenameErr.code === 'EBUSY' || lastRenameErr.code === 'EACCES');
+            if (!isLockErr) {
+                throw lastRenameErr;
+            }
+            if (IS_AUTO_MODE || IS_TAKEOVER_POST_UPDATE) {
                 throw new Error(msg(
-                    `目標 app.asar 正被鎖定 (${renameErr.code})，自動模式禁止熱覆寫，已安全取消。`,
-                    `目标 app.asar 正被锁定 (${renameErr.code})，自动模式禁止热覆盖，已安全取消。`
+                    `目標 app.asar 正被鎖定 (${lastRenameErr.code})，自動或更新接管模式禁止熱覆寫，已安全取消。`,
+                    `目标 app.asar 正被锁定 (${lastRenameErr.code})，自动或更新接管模式禁止热覆盖，已安全取消。`
                 ));
             }
             fs.copyFileSync(tempAsarPath, asarPath);
@@ -3517,16 +3699,29 @@ function buildUpdateWatchdogVbs() {
     const lines = [
         'Option Explicit',
         'On Error Resume Next',
-        'Dim fso, sh, guardDir, lockPath, lockStream',
+        'Dim fso, sh, guardDir, lockPath, lockStream, logPath',
         'Set fso = CreateObject("Scripting.FileSystemObject")',
         'Set sh = CreateObject("WScript.Shell")',
         'guardDir = fso.GetParentFolderName(WScript.ScriptFullName)',
+        'logPath = guardDir & "\\guard.log"',
         'lockPath = guardDir & "\\watchdog.lock"',
         'Set lockStream = fso.OpenTextFile(lockPath, 2, True)',
         'If Err.Number <> 0 Then',
         '    WScript.Quit 0',
         'End If',
         'Err.Clear',
+        '',
+        'Sub WriteWatchdogLog(text)',
+        '    On Error Resume Next',
+        '    Dim ts, ls',
+        '    ts = Year(Now) & "-" & Right("0" & Month(Now), 2) & "-" & Right("0" & Day(Now), 2) & " " & Right("0" & Hour(Now), 2) & ":" & Right("0" & Minute(Now), 2) & ":" & Right("0" & Second(Now), 2)',
+        '    Set ls = fso.OpenTextFile(logPath, 8, True)',
+        '    If Err.Number = 0 Then',
+        '        ls.WriteLine "[" & ts & "] [WATCHDOG] " & text',
+        '        ls.Close',
+        '    End If',
+        '    Err.Clear',
+        'End Sub',
         '',
         'Dim installDir, oldPid, relaunchFlag',
         'installDir = ""',
@@ -3540,10 +3735,14 @@ function buildUpdateWatchdogVbs() {
         'If installDir = "" Then',
         '    installDir = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\\Programs\\antigravity"',
         'End If',
+        'Do While Right(installDir, 1) = "\\" Or Right(installDir, 1) = "/"',
+        '    installDir = Left(installDir, Len(installDir) - 1)',
+        'Loop',
         '',
         'Dim wmi',
         'Set wmi = GetObject("winmgmts:\\\\.\\root\\cimv2")',
         'If Err.Number <> 0 Then',
+        '    WriteWatchdogLog "Abort: failed to connect WMI."',
         '    lockStream.Close',
         '    WScript.Quit 0',
         'End If',
@@ -3578,27 +3777,113 @@ function buildUpdateWatchdogVbs() {
         '    Err.Clear',
         'End Function',
         '',
-        'Function IsInstallerRunning()',
-        '    IsInstallerRunning = IsProcessRunning("Antigravity-x64.exe") Or IsProcessRunning("Antigravity-arm64.exe")',
-        '    If Not IsInstallerRunning Then',
-        '        Dim col, item',
-        '        Err.Clear',
-        '        Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'installer.exe\' AND ExecutablePath LIKE \'%antigravity-updater%\'")',
-        '        If Err.Number = 0 Then',
-        '            For Each item In col',
-        '                IsInstallerRunning = True',
-        '                Exit For',
-        '            Next',
-        '        End If',
-        '        Err.Clear',
+        'Function IsLocalizationScriptCmd(cmdVal)',
+        '    IsLocalizationScriptCmd = False',
+        '    If IsNull(cmdVal) Then Exit Function',
+        '    If InStr(1, LCase(CStr(cmdVal)), "localization_engine.js", 1) > 0 Then',
+        '        IsLocalizationScriptCmd = True',
         '    End If',
         'End Function',
+        '',
+        'Function HasAppRunningInDir(targetDir)',
+        '    HasAppRunningInDir = False',
+        '    Dim col, item, normDir, normExe, normCmd',
+        '    normDir = LCase(Trim(targetDir))',
+        '    Do While Right(normDir, 1) = "\\" Or Right(normDir, 1) = "/"',
+        '        normDir = Left(normDir, Len(normDir) - 1)',
+        '    Loop',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'Antigravity.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If Not IsLocalizationScriptCmd(item.CommandLine) Then',
+        '                If IsNull(item.ExecutablePath) Then normExe = "" Else normExe = LCase(CStr(item.ExecutablePath))',
+        '                If IsNull(item.CommandLine) Then normCmd = "" Else normCmd = LCase(CStr(item.CommandLine))',
+        '                If normDir = "" Then',
+        '                    HasAppRunningInDir = True',
+        '                    Exit For',
+        '                ElseIf normExe = normDir & "\\antigravity.exe" Or Left(normExe, Len(normDir) + 1) = normDir & "\\" Then',
+        '                    HasAppRunningInDir = True',
+        '                    Exit For',
+        '                ElseIf normExe = "" And (InStr(1, normCmd, normDir, 1) > 0 Or InStr(1, normCmd, "--updated", 1) > 0) Then',
+        '                    HasAppRunningInDir = True',
+        '                    Exit For',
+        '                End If',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        'End Function',
+        '',
+        'Function HasUpdatedAppInDir(targetDir, prevPid)',
+        '    HasUpdatedAppInDir = False',
+        '    Dim col, item, normDir, normExe, normCmd',
+        '    normDir = LCase(Trim(targetDir))',
+        '    Do While Right(normDir, 1) = "\\" Or Right(normDir, 1) = "/"',
+        '        normDir = Left(normDir, Len(normDir) - 1)',
+        '    Loop',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'Antigravity.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If CLng(item.ProcessId) <> prevPid And Not IsLocalizationScriptCmd(item.CommandLine) Then',
+        '                If IsNull(item.ExecutablePath) Then normExe = "" Else normExe = LCase(CStr(item.ExecutablePath))',
+        '                If IsNull(item.CommandLine) Then normCmd = "" Else normCmd = LCase(CStr(item.CommandLine))',
+        '                If (normExe = "" Or normExe = normDir & "\\antigravity.exe" Or Left(normExe, Len(normDir) + 1) = normDir & "\\") And InStr(1, normCmd, "--updated", 1) > 0 Then',
+        '                    HasUpdatedAppInDir = True',
+        '                    Exit For',
+        '                End If',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        'End Function',
+        '',
+        'Function IsInstallerRunning()',
+        '    IsInstallerRunning = IsProcessRunning("Antigravity-x64.exe") Or IsProcessRunning("Antigravity-arm64.exe")',
+        '    If IsInstallerRunning Then Exit Function',
+        '    Dim col, item, ep, cl',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'installer.exe\' AND ExecutablePath LIKE \'%antigravity-updater%\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            IsInstallerRunning = True',
+        '            Exit Function',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'elevate.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If IsNull(item.ExecutablePath) Then ep = "" Else ep = LCase(CStr(item.ExecutablePath))',
+        '            If IsNull(item.CommandLine) Then cl = "" Else cl = LCase(CStr(item.CommandLine))',
+        '            If InStr(1, ep, "antigravity", 1) > 0 Or InStr(1, cl, "antigravity", 1) > 0 Then',
+        '                IsInstallerRunning = True',
+        '                Exit Function',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name LIKE \'Au_%.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If IsNull(item.CommandLine) Then cl = "" Else cl = LCase(CStr(item.CommandLine))',
+        '            If InStr(1, cl, "keep_app_data", 1) > 0 Or InStr(1, cl, "antigravity", 1) > 0 Then',
+        '                IsInstallerRunning = True',
+        '                Exit Function',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        'End Function',
+        '',
+        'WriteWatchdogLog "Started: oldPid=" & oldPid & " relaunch=" & relaunchFlag & " dir=" & installDir',
         '',
         'Dim i, sawInstaller, stillAlive',
         'sawInstaller = False',
         'stillAlive = False',
         'If oldPid > 0 Then',
-        '    For i = 1 To 180',
+        '    For i = 1 To 240',
         '        If IsInstallerRunning() Then sawInstaller = True',
         '        If Not IsPidAlive(oldPid) Then Exit For',
         '        WScript.Sleep 500',
@@ -3606,13 +3891,18 @@ function buildUpdateWatchdogVbs() {
         '    If IsPidAlive(oldPid) Then stillAlive = True',
         'End If',
         'If stillAlive Then',
+        '    WriteWatchdogLog "Abort: oldPid=" & oldPid & " still alive after 120s."',
         '    lockStream.Close',
         '    WScript.Quit 0',
         'End If',
         '',
         'If Not sawInstaller Then',
-        '    For i = 1 To 10',
+        '    For i = 1 To 20',
         '        If IsInstallerRunning() Then',
+        '            sawInstaller = True',
+        '            Exit For',
+        '        End If',
+        '        If HasUpdatedAppInDir(installDir, oldPid) Then',
         '            sawInstaller = True',
         '            Exit For',
         '        End If',
@@ -3620,20 +3910,37 @@ function buildUpdateWatchdogVbs() {
         '    Next',
         'End If',
         '',
-        'For i = 1 To 360',
-        '    If Not IsInstallerRunning() Then Exit For',
+        'For i = 1 To 600',
+        '    If Not IsInstallerRunning() Then',
+        '        WScript.Sleep 350',
+        '        If Not IsInstallerRunning() Then Exit For',
+        '    End If',
         '    WScript.Sleep 500',
         'Next',
-        'WScript.Sleep 1200',
         '',
-        'Dim exePath, enginePath, langArg, langModePath, langStream, langModeVal, cmdBase',
+        'If Not HasAppRunningInDir(installDir) Then',
+        '    For i = 1 To 6',
+        '        WScript.Sleep 250',
+        '        If HasAppRunningInDir(installDir) Or IsInstallerRunning() Then Exit For',
+        '    Next',
+        'End If',
+        '',
+        'Dim exePath, enginePath, launchVbsPath, sysRoot, wscriptExe',
         'exePath = installDir & "\\Antigravity.exe"',
         'enginePath = guardDir & "\\localization_engine.js"',
-        'If Not fso.FileExists(exePath) Or Not fso.FileExists(enginePath) Then',
+        'launchVbsPath = guardDir & "\\launch_gui.vbs"',
+        'sysRoot = sh.ExpandEnvironmentStrings("%SystemRoot%")',
+        'If sysRoot = "" Or sysRoot = "%SystemRoot%" Then sysRoot = "C:\\Windows"',
+        'wscriptExe = sysRoot & "\\System32\\wscript.exe"',
+        'If Not fso.FileExists(wscriptExe) Then wscriptExe = "wscript.exe"',
+        '',
+        'If Not fso.FileExists(enginePath) Then',
+        '    WriteWatchdogLog "Abort: missing enginePath=" & enginePath',
         '    lockStream.Close',
         '    WScript.Quit 0',
         'End If',
         '',
+        'Dim langArg, langModePath, langStream, langModeVal',
         'langArg = ""',
         'langModePath = guardDir & "\\lang_mode.txt"',
         'If fso.FileExists(langModePath) Then',
@@ -3652,27 +3959,74 @@ function buildUpdateWatchdogVbs() {
         '    Err.Clear',
         'End If',
         '',
-        'sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
-        'cmdBase = """" & exePath & """ """ & enginePath & """" & langArg & " --brand-title english --auto --if-needed --quiet --install-dir """ & installDir & """"',
+        'Dim cmdCheck, cmdPatch, rcCheck, rcPatch, attempt, didTakeover, needRelaunch, completed',
+        'didTakeover = False',
+        'needRelaunch = (relaunchFlag = "1")',
+        'completed = False',
         '',
-        'If Not IsInstallerRunning() And Not IsProcessRunning("Antigravity.exe") Then',
-        '    Dim cmdLaunch',
-        '    cmdLaunch = cmdBase',
-        '    If relaunchFlag = "1" Then cmdLaunch = cmdLaunch & " --launch"',
-        '    sh.Run cmdLaunch, 0, True',
-        '    lockStream.Close',
-        '    WScript.Quit 0',
-        'End If',
+        'For attempt = 1 To 12',
+        '    If IsInstallerRunning() Then',
+        '        WriteWatchdogLog "Attempt " & attempt & ": installer still active; waiting."',
+        '        WScript.Sleep 1500',
+        '    ElseIf Not fso.FileExists(exePath) Then',
+        '        WriteWatchdogLog "Attempt " & attempt & ": waiting for Antigravity.exe to appear."',
+        '        WScript.Sleep 1500',
+        '    Else',
+        '        cmdCheck = """" & exePath & """ """ & enginePath & """" & langArg & " --check-patch-needed --install-dir """ & installDir & """"',
+        '        cmdPatch = """" & exePath & """ """ & enginePath & """" & langArg & " --brand-title english --takeover-post-update --no-guard --quiet --install-dir """ & installDir & """"',
+        '        sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
+        '        rcCheck = sh.Run(cmdCheck, 0, True)',
+        '        Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
         '',
-        'Dim waitIdx',
-        'For waitIdx = 1 To 120',
-        '    WScript.Sleep 5000',
-        '    If Not IsInstallerRunning() And Not IsProcessRunning("Antigravity.exe") Then',
-        '        sh.Run cmdBase, 0, True',
-        '        Exit For',
+        '        If rcCheck = 0 Then',
+        '            If (needRelaunch Or didTakeover) And Not HasAppRunningInDir(installDir) Then',
+        '                If fso.FileExists(launchVbsPath) Then',
+        '                    sh.Run """" & wscriptExe & """ //B //Nologo """ & launchVbsPath & """ """ & exePath & """ """ & installDir & """", 0, True',
+        '                Else',
+        '                    sh.Run """" & exePath & """", 1, False',
+        '                End If',
+        '                WriteWatchdogLog "Verified localized on attempt " & attempt & "; launched Antigravity GUI."',
+        '            Else',
+        '                WriteWatchdogLog "Verified localized on attempt " & attempt & "; already running or no launch needed."',
+        '            End If',
+        '            WScript.Sleep 1500',
+        '            sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
+        '            rcCheck = sh.Run(cmdCheck, 0, True)',
+        '            Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '            If rcCheck = 0 Then',
+        '                completed = True',
+        '                Exit For',
+        '            End If',
+        '            WriteWatchdogLog "Post-launch verification detected reversion; retrying localization."',
+        '        ElseIf rcCheck = 10 Then',
+        '            If HasAppRunningInDir(installDir) Then',
+        '                didTakeover = True',
+        '                needRelaunch = True',
+        '                WriteWatchdogLog "Attempt " & attempt & ": unlocalized app running after update; taking over (--takeover-post-update)."',
+        '            Else',
+        '                WriteWatchdogLog "Attempt " & attempt & ": unlocalized ASAR detected; applying localization."',
+        '            End If',
+        '            sh.Environment("PROCESS")("ELECTRON_RUN_AS_NODE") = "1"',
+        '            rcPatch = sh.Run(cmdPatch, 0, True)',
+        '            Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
+        '            If rcPatch <> 0 Then',
+        '                WriteWatchdogLog "Attempt " & attempt & ": patch returned rc=" & rcPatch & "; retrying."',
+        '                WScript.Sleep 1500',
+        '            Else',
+        '                WScript.Sleep 400',
+        '            End If',
+        '        Else',
+        '            WriteWatchdogLog "Attempt " & attempt & ": ASAR not ready (rc=" & rcCheck & "); retrying."',
+        '            WScript.Sleep 1500',
+        '        End If',
         '    End If',
         'Next',
         '',
+        'If Not completed Then',
+        '    WriteWatchdogLog "Finished 12 attempts without complete verification."',
+        'End If',
+        '',
+        'Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
         'lockStream.Close'
     ];
     return lines.join('\r\n') + '\r\n';
@@ -3687,18 +4041,6 @@ function buildGuardVbs() {
         'Set sh = CreateObject("WScript.Shell")',
         'guardDir = fso.GetParentFolderName(WScript.ScriptFullName)',
         '',
-        'Dim wmi, col, item',
-        'Set wmi = GetObject("winmgmts:\\\\.\\root\\cimv2")',
-        'If Err.Number = 0 Then',
-        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'Antigravity.exe\' OR Name=\'Antigravity-x64.exe\' OR Name=\'Antigravity-arm64.exe\'")',
-        '    If Err.Number = 0 Then',
-        '        For Each item In col',
-        '            WScript.Quit 0',
-        '        Next',
-        '    End If',
-        'End If',
-        'Err.Clear',
-        '',
         'watchLockPath = guardDir & "\\watchdog.lock"',
         'If fso.FileExists(watchLockPath) Then',
         '    Set watchTest = fso.OpenTextFile(watchLockPath, 2, True)',
@@ -3708,6 +4050,56 @@ function buildGuardVbs() {
         '    watchTest.Close',
         '    Err.Clear',
         'End If',
+        '',
+        'Dim wmi, col, item, cmdVal, epVal',
+        'Set wmi = GetObject("winmgmts:\\\\.\\root\\cimv2")',
+        'If Err.Number = 0 Then',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name=\'Antigravity.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If IsNull(item.CommandLine) Then cmdVal = "" Else cmdVal = LCase(CStr(item.CommandLine))',
+        '            If InStr(1, cmdVal, "localization_engine.js", 1) = 0 Then',
+        '                WScript.Quit 0',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'Antigravity-x64.exe\' OR Name=\'Antigravity-arm64.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            WScript.Quit 0',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name=\'installer.exe\' AND ExecutablePath LIKE \'%antigravity-updater%\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            WScript.Quit 0',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name=\'elevate.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If IsNull(item.ExecutablePath) Then epVal = "" Else epVal = LCase(CStr(item.ExecutablePath))',
+        '            If IsNull(item.CommandLine) Then cmdVal = "" Else cmdVal = LCase(CStr(item.CommandLine))',
+        '            If InStr(1, epVal, "antigravity", 1) > 0 Or InStr(1, cmdVal, "antigravity", 1) > 0 Then',
+        '                WScript.Quit 0',
+        '            End If',
+        '        Next',
+        '    End If',
+        '    Err.Clear',
+        '    Set col = wmi.ExecQuery("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name LIKE \'Au_%.exe\'")',
+        '    If Err.Number = 0 Then',
+        '        For Each item In col',
+        '            If IsNull(item.CommandLine) Then cmdVal = "" Else cmdVal = LCase(CStr(item.CommandLine))',
+        '            If InStr(1, cmdVal, "keep_app_data", 1) > 0 Or InStr(1, cmdVal, "antigravity", 1) > 0 Then',
+        '                WScript.Quit 0',
+        '            End If',
+        '        Next',
+        '    End If',
+        'End If',
+        'Err.Clear',
         '',
         'lockPath = guardDir & "\\guard.lock"',
         'Set lockStream = fso.OpenTextFile(lockPath, 2, True)',
@@ -3757,6 +4149,7 @@ function buildGuardVbs() {
         '    Dim cmd',
         '    cmd = """" & exePath & """ """ & enginePath & """" & langArg & " --brand-title english --auto --if-needed --quiet --install-dir """ & installDir & """"',
         '    sh.Run cmd, 0, True',
+        '    Call sh.Environment("PROCESS").Remove("ELECTRON_RUN_AS_NODE")',
         'End If',
         '',
         'lockStream.Close'
@@ -3788,11 +4181,7 @@ function buildGuardTaskXml(guardVbsPath, workingDir) {
 `  <Triggers>\r\n` +
 `    <LogonTrigger>\r\n` +
 `      <Enabled>true</Enabled>\r\n` +
-`      <Delay>PT30S</Delay>\r\n` +
-`      <Repetition>\r\n` +
-`        <Interval>PT15M</Interval>\r\n` +
-`        <StopAtDurationEnd>false</StopAtDurationEnd>\r\n` +
-`      </Repetition>\r\n` +
+`      <Delay>PT10S</Delay>\r\n` +
 `    </LogonTrigger>\r\n` +
 `    <TimeTrigger>\r\n` +
 `      <StartBoundary>${startBoundary}</StartBoundary>\r\n` +
@@ -4140,13 +4529,22 @@ function main() {
     const targetLang = USE_TW ? 'tw' : 'cn';
     const langDisplay = msg('繁體中文', '简体中文');
 
+    if (IS_CHECK_PATCH_NEEDED) {
+        const st = inspectAsarStatus(asarPath);
+        if (!st.valid) {
+            process.exit(1);
+        }
+        const needsPatch = !st.isLocalized || st.installedLang !== targetLang || (process.platform === 'win32' && !st.hasUpdaterHook);
+        process.exit(needsPatch ? 10 : 0);
+    }
+
     if (IS_CHECK_ONLY) {
         const st = inspectAsarStatus(asarPath);
         const guardDir = getGuardDir();
         const watchdogReady = fs.existsSync(path.join(guardDir, 'update_watchdog.vbs')) &&
             fs.existsSync(path.join(guardDir, 'localization_engine.js'));
         const taskReady = isGuardTaskRegistered();
-        const procSt = getRunningStatus();
+        const procSt = getRunningStatus(installDir);
 
         console.log(msg("====== Antigravity 中文化與自動偵測狀態檢查 ======", "====== Antigravity 汉化与自动检测状态检查 ======"));
         console.log(msg(`- 系統偵測語系: ${langDisplay} (來源=${DETECTED_LANG_INFO.source}, 原始值=${DETECTED_LANG_INFO.rawLocale}, 模式=${LANG_SELECTION_MODE})`,
@@ -4158,7 +4556,10 @@ function main() {
             ? msg('未注入（官方英文原版）', '未注入（官方英文原版）')
             : (st.installedLang === 'tw' ? msg('已注入（繁體中文）', '已注入（繁体中文）') : msg('已注入（简体中文）', '已注入（简体中文）'));
         console.log(msg(`- 漢化注入: ${injectedLabel}`, `- 汉化注入: ${injectedLabel}`));
-        console.log(msg(`- 更新即時偵測 Hook: ${st.hasUpdaterHook ? '已注入' : '未注入'}`, `- 更新即时检测 Hook: ${st.hasUpdaterHook ? '已注入' : '未注入'}`));
+        const hookLabel = !st.hasUpdaterHook
+            ? msg('未注入', '未注入')
+            : (st.hasLatestUpdaterHook ? msg('已注入 (V2 搶跑接管就緒)', '已注入 (V2 抢跑接管就绪)') : msg('已注入 (舊版 V1，閒置時將自動升級)', '已注入 (旧版 V1，空闲时将自动升级)'));
+        console.log(msg(`- 更新即時偵測 Hook: ${hookLabel}`, `- 更新即时检测 Hook: ${hookLabel}`));
         if (process.platform === 'win32') {
             console.log(msg(`- 獨立看門狗鏡像: ${watchdogReady ? `就緒 (${guardDir})` : '未就緒'}`, `- 独立看门狗镜像: ${watchdogReady ? `就绪 (${guardDir})` : '未就绪'}`));
             console.log(msg(`- 背景排程守衛 (${GUARD_TASK_NAME}): ${taskReady ? '已啟用' : '未啟用'}`, `- 后台计划任务守卫 (${GUARD_TASK_NAME}): ${taskReady ? '已启用' : '未启用'}`));
@@ -4175,9 +4576,9 @@ function main() {
     }
 
     // 2. 檢測用戶端或更新安裝器是否正在運行
-    const runningStatus = getRunningStatus();
+    const runningStatus = getRunningStatus(installDir);
     wasAppRunning = runningStatus.appRunning || runningStatus.updaterRunning;
-    if (IS_AUTO_MODE && wasAppRunning) {
+    if (!IS_TAKEOVER_POST_UPDATE && IS_AUTO_MODE && wasAppRunning) {
         console.log(msg(
             `[跳過] 自動模式偵測到進程運行中 (app=${runningStatus.appRunning}, updater=${runningStatus.updaterRunning})，安全待命不寫入。`,
             `[跳过] 自动模式检测到进程运行中 (app=${runningStatus.appRunning}, updater=${runningStatus.updaterRunning})，安全待命不写入。`
@@ -4185,12 +4586,12 @@ function main() {
         process.exit(0);
     }
 
-    if (!IS_AUTO_MODE && runningStatus.updaterRunning) {
+    if (runningStatus.updaterRunning) {
         console.error(msg(
             `[錯誤] 偵測到 Antigravity 官方更新安裝程式正在執行，請稍候十數秒待更新完成後再試。`,
             `[错误] 检测到 Antigravity 官方更新安装程序正在运行，请稍候十数秒待更新完成后再试。`
         ));
-        process.exit(1);
+        process.exit(IS_TAKEOVER_POST_UPDATE ? 2 : 1);
     }
 
     if (!IS_QUIET) {
@@ -4201,8 +4602,8 @@ function main() {
     }
 
     let closedRunningApp = false;
-    if (!IS_AUTO_MODE && !noKill && (runningStatus.appRunning || process.env.AG_TEST_TARGET_IMAGE)) {
-        closedRunningApp = closeAntigravityProcesses();
+    if ((IS_TAKEOVER_POST_UPDATE || (!IS_AUTO_MODE && !noKill)) && (runningStatus.appRunning || process.env.AG_TEST_TARGET_IMAGE)) {
+        closedRunningApp = closeAntigravityProcesses({ installDir, waitForExitMs: 10000 });
     } else if (!IS_QUIET && noKill) {
         console.log(msg("[跳過] 偵測到 --no-kill 參數，跳過關閉 Antigravity 執行進程。", "[跳过] 检测到 --no-kill 参数，跳过关闭 Antigravity 运行进程。"));
     }
@@ -4241,10 +4642,10 @@ function main() {
         }
     }
 
-    const shouldLaunch = IS_LAUNCH || (!IS_AUTO_MODE && closedRunningApp);
+    const shouldLaunch = IS_LAUNCH || (!IS_AUTO_MODE && !IS_TAKEOVER_POST_UPDATE && closedRunningApp);
     let launchedGui = false;
     if (success && shouldLaunch && (process.platform === 'win32' || process.platform === 'darwin')) {
-        const afterStatus = getRunningStatus();
+        const afterStatus = getRunningStatus(installDir);
         if ((!afterStatus.appRunning && !afterStatus.updaterRunning) || process.env.AG_TEST_LAUNCH_RECORD_FILE) {
             launchedGui = launchAntigravityGui(installDir, huifu);
         }
@@ -4299,9 +4700,14 @@ module.exports = {
     detectSystemLanguage,
     classifyLocaleTag,
     closeAntigravityProcesses,
+    getRunningStatus,
     launchAntigravityGui,
     buildLaunchGuiVbs,
+    buildUpdateWatchdogVbs,
+    buildGuardVbs,
+    buildGuardTaskXml,
     SIGNATURE_START,
     UPDATER_HOOK_START,
+    UPDATER_HOOK_VERSION_MARKER,
     UPDATER_HOOK_END
 };
