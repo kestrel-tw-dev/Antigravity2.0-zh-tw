@@ -493,29 +493,47 @@ function normalizeText(text) {
                .replace(/…/g, '...');
 }
 
+function getDictLoadPriority(file) {
+    const patchMatch = file.match(/^page_v(\d+)_extra\.json$/i);
+    if (patchMatch) {
+        return [10, parseInt(patchMatch[1], 10), file];
+    }
+    const versionSettingsMatch = file.match(/^page_settings_v(\d+)\.json$/i);
+    if (versionSettingsMatch) {
+        return [30, parseInt(versionSettingsMatch[1], 10), file];
+    }
+    return [20, 0, file];
+}
+
 function loadDictionary() {
     const totalMap = {};
     const dictsDir = path.join(__dirname, DICTS_FOLDER);
     if (fs.existsSync(dictsDir)) {
-        const files = fs.readdirSync(dictsDir);
+        const files = fs.readdirSync(dictsDir)
+            .filter(f => f.endsWith('.json'))
+            .sort((a, b) => {
+                const pa = getDictLoadPriority(a);
+                const pb = getDictLoadPriority(b);
+                if (pa[0] !== pb[0]) return pa[0] - pb[0];
+                if (pa[1] !== pb[1]) return pa[1] - pb[1];
+                return pa[2].localeCompare(pb[2], 'en');
+            });
         for (const file of files) {
-            if (file.endsWith('.json')) {
-                try {
-                    const filePath = path.join(dictsDir, file);
-                    const fileContent = fs.readFileSync(filePath, 'utf-8');
-                    const data = JSON.parse(fileContent);
-                    for (const [k, v] of Object.entries(data)) {
-                        const normK = normalizeText(k);
-                        if (k !== normK && (/^ [^\s]/.test(k) || /[^\s] $/.test(k))) {
-                            totalMap[k] = v;
-                            if (!(normK in totalMap)) totalMap[normK] = v;
-                        } else if (normK) {
-                            totalMap[normK] = v;
-                        }
+            try {
+                const filePath = path.join(dictsDir, file);
+                const fileContent = fs.readFileSync(filePath, 'utf-8');
+                const data = JSON.parse(fileContent);
+                for (const [k, v] of Object.entries(data)) {
+                    const normK = normalizeText(k);
+                    if (k !== normK && (/^ [^\s]/.test(k) || /[^\s] $/.test(k))) {
+                        totalMap[k] = v;
+                        if (!(normK in totalMap)) totalMap[normK] = v;
+                    } else if (normK) {
+                        totalMap[normK] = v;
                     }
-                } catch (e) {
-                    // ignore
                 }
+            } catch (e) {
+                // ignore
             }
         }
     }
@@ -529,10 +547,7 @@ function loadDictionary() {
 
 function generateJs(preloadedDict) {
     const fullDict = preloadedDict || loadDictionary();
-    const longEntries = Object.entries(fullDict).sort((a, b) => b[0].length - a[0].length);
-    
-    const dictJson = JSON.stringify(fullDict, null, 4);
-    const entriesJson = JSON.stringify(longEntries);
+    const dictJson = JSON.stringify(fullDict);
 
     const jsSource = `${SIGNATURE_START}
 (() => {
@@ -550,7 +565,9 @@ function generateJs(preloadedDict) {
         lowerMap.set(lowerK, v);
     }
     
-    const longEntries = REPLACEMENT_ENTRIES_PLACEHOLDER;
+    const longEntries = Array.from(map.entries())
+        .filter(([k]) => k.length > 15)
+        .sort((a, b) => b[0].length - a[0].length);
     const translatedValues = new WeakMap();
     const observedRoots = new WeakSet();
     const hookedFrames = new WeakSet();
@@ -648,10 +665,10 @@ function generateJs(preloadedDict) {
 
         // 動態操作語句正則匹配
         if (/^Step (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i.test(normText)) {
-            return normText.replace(/^Step (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => "步驟 " + a + " / " + b + rest);
+            return normText.replace(/^Step (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => (USE_TW ? "步驟 " : "步骤 ") + a + " / " + b + rest);
         }
         if (/^Step (\\d+):?\\s*(.+)$/i.test(normText)) {
-            return normText.replace(/^Step (\\d+):?\\s*(.+)$/i, (m, num, desc) => "步驟 " + num + "：" + desc);
+            return normText.replace(/^Step (\\d+):?\\s*(.+)$/i, (m, num, desc) => (USE_TW ? "步驟 " : "步骤 ") + num + "：" + desc);
         }
         if (/^Subtask (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i.test(normText)) {
             return normText.replace(/^Subtask (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => (USE_TW ? "子任務 " : "子任务 ") + a + " / " + b + rest);
@@ -672,7 +689,12 @@ function generateJs(preloadedDict) {
             return normText.replace(/^Task (\\d+):?\\s*(.+)$/i, (m, num, desc) => (USE_TW ? "任務 " : "任务 ") + num + "：" + desc);
         }
         if (/^Checkpoint #?(\\d+)(.*)$/i.test(normText)) {
-            return normText.replace(/^Checkpoint #?(\\d+)(.*)$/i, (m, num, rest) => (USE_TW ? "檢查點 #" : "检查点 #") + num + rest);
+            return normText.replace(/^Checkpoint #?(\\d+)(.*)$/i, (m, num, rest) => {
+                let restZh = rest;
+                restZh = restZh.replace(/\\(Steps (\\d+)[–-](\\d+)\\)/gi, (sm, s1, s2) => USE_TW ? ("（步驟 " + s1 + "–" + s2 + "）") : ("（步骤 " + s1 + "–" + s2 + "）"));
+                restZh = restZh.replace(/\\(Intent Only\\)/gi, USE_TW ? "（僅限意圖）" : "（仅限意向）");
+                return (USE_TW ? "檢查點 #" : "检查点 #") + num + restZh;
+            });
         }
         if (/^Command (exited|finished|completed|failed) with (?:exit )?code (\\d+)$/i.test(normText)) {
             return normText.replace(/^Command (exited|finished|completed|failed) with (?:exit )?code (\\d+)$/i, (m, verb, code) => {
@@ -741,12 +763,12 @@ function generateJs(preloadedDict) {
         }
         if (/^Output truncated \\((?:showing )?(?:the )?(first|last) (\\d+) lines?\\)$/i.test(normText)) {
             return normText.replace(/^Output truncated \\((?:showing )?(?:the )?(first|last) (\\d+) lines?\\)$/i, (m, pos, num) => {
-                const pZh = /^first/i.test(pos) ? "前" : "後";
+                const pZh = /^first/i.test(pos) ? "前" : (USE_TW ? "後" : "后");
                 return USE_TW ? ("輸出已截斷（顯示" + pZh + " " + num + " 行）") : ("输出已截断（显示" + pZh + " " + num + " 行）");
             });
         }
-        if (/^Output truncated \\((\\d+) bytes total\\)$/i.test(normText)) {
-            return normText.replace(/^Output truncated \\((\\d+) bytes total\\)$/i, (m, bytes) => {
+        if (/^Output truncated \\(([\\d,]+) bytes? total\\)$/i.test(normText)) {
+            return normText.replace(/^Output truncated \\(([\\d,]+) bytes? total\\)$/i, (m, bytes) => {
                 return USE_TW ? ("輸出已截斷（共 " + bytes + " 位元組）") : ("输出已截断（共 " + bytes + " 字节）");
             });
         }
@@ -1338,6 +1360,7 @@ function generateJs(preloadedDict) {
 
                 let originalVal = node.nodeValue;
                 if (!originalVal || originalVal.trim().length < 1) return;
+                if (!/[A-Za-z]/.test(originalVal)) return;
 
                 // 处理 FastPick / 列表底部由于 React 节点拆分导致的 "Show ", num, " more..." 分段文本
                 const parentText = node.parentElement && node.parentElement.textContent ? node.parentElement.textContent.trim() : '';
@@ -1406,7 +1429,7 @@ function generateJs(preloadedDict) {
                 } else if (/^Queue message\\s+(Enter|⏎|\\u23ce)$/i.test(valNorm)) {
                     newVal = (USE_TW ? "排隊傳送訊息 " : "排队发送消息 ") + valNorm.replace(/^Queue message\\s+/i, '');
                 } else if (/^to have the agent generate a plan\\.?$/i.test(valNorm)) {
-                    newVal = USE_TW ? "讓代理生成計劃。" : "让智能体生成计划。";
+                    newVal = USE_TW ? "讓代理生成計畫。" : "让智能体生成计划。";
                 } else if ((valNorm === 'Type' || valNorm === 'and select') && node.parentElement && (
                     (typeof node.parentElement.closest === 'function' && node.parentElement.closest('[data-testid="plan-command-fyi-alert"]')) ||
                     (node.parentElement.textContent && node.parentElement.textContent.includes('generate a plan'))
@@ -1488,10 +1511,6 @@ function generateJs(preloadedDict) {
                     newVal = valNorm.replace(/^Yes, and always allow '(.+)'$/i, (match, cmd) => {
                         return USE_TW ? ("是，且一律允許執行 '" + cmd + "'") : ("是，且始终允许运行 '" + cmd + "'");
                     });
-                } else if (/^(\\d+) tools? enabled$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^(\\d+) tools? enabled$/i, (match, num) => {
-                        return USE_TW ? (num + " 個工具已啟用") : (num + " 个工具已启用");
-                    });
                 } else if (/^Show\\s+(\\d+)\\s+more(\\s+(results?|items?|commands?|options?))?(\\.\\.\\.|…)?$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^Show\\s+(\\d+)\\s+more(\\s+(results?|items?|commands?|options?))?(\\.\\.\\.|…)?$/i, (match, num, p2, type) => {
                         if (type) {
@@ -1512,10 +1531,6 @@ function generateJs(preloadedDict) {
                     newVal = USE_TW ? "顯示明細" : "显示细目";
                 } else if (/^Hide\\s+tools$/i.test(valNorm)) {
                     newVal = USE_TW ? "收起工具" : "收起工具";
-                } else if (/^(\\d+)\\s+tools$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^(\\d+)\\s+tools$/i, (match, num) => {
-                        return num + (USE_TW ? " 個工具" : " 个工具");
-                    });
                 } else if (/^(\\d+)\\s+tools?\\s+excluded$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^(\\d+)\\s+tools?\\s+excluded$/i, (match, num) => {
                         return num + (USE_TW ? " 個工具已排除" : " 个工具已排除");
@@ -1539,14 +1554,6 @@ function generateJs(preloadedDict) {
                 } else if (/^See all\\s*\\((\\d+)\\)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^See all\\s*\\((\\d+)\\)$/i, (match, num) => {
                         return USE_TW ? ("顯示全部 (" + num + ")") : ("显示全部 (" + num + ")");
-                    });
-                } else if (/^Available AI Credits: (\\d+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Available AI Credits: (\\d+)$/i, (match, num) => {
-                        return USE_TW ? ("可用 AI 額度: " + num) : ("可用 AI 额度: " + num);
-                    });
-                } else if (/^Version\\s+([\\d\\.]+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Version\\s+([\\d\\.]+)$/i, (match, v) => {
-                        return "版本 " + v;
                     });
                 } else if (/^(\\d+)(s|m|h|d|w|mo|yr)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^(\\d+)(s|m|h|d|w|mo|yr)$/i, (match, num, unit) => {
@@ -1612,12 +1619,6 @@ function generateJs(preloadedDict) {
                             return "以 " + email + (USE_TW ? " 身分傳送意見回饋" : " 身份发送反馈");
                         }
                         return USE_TW ? "以此身分傳送意見回饋：" : "以如下身份发送反馈：";
-                    });
-                } else if (/^(Thought|Thinking|Worked) for\\s+(.+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^(Thought|Thinking|Worked) for\\s+(.+)$/i, (match, verb, dur) => {
-                        const vZh = /^Thought/i.test(verb) ? "已思考 " : (/^Thinking/i.test(verb) ? "正在思考 " : "已工作 ");
-                        const dZh = dur.trim().replace(/(\\d+)\\s*h(?:ours?|r)?/gi, USE_TW ? "$1 小時" : "$1 小时").replace(/(\\d+)\\s*m(?:inutes?|in)?/gi, USE_TW ? "$1 分鐘" : "$1 分钟").replace(/(\\d+)\\s*s(?:econds?|ec)?/gi, "$1 秒");
-                        return vZh + dZh;
                     });
                 } else if (/^No more older messages,\\s*showing\\s+(\\d+)\\s+of\\s+(\\d+)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^No more older messages,\\s*showing\\s+(\\d+)\\s+of\\s+(\\d+)$/i, (match, a, b) => {
@@ -1693,110 +1694,14 @@ function generateJs(preloadedDict) {
                     newVal = valNorm.replace(/^Requires manual confirmation:\\s*(.+)$/i, (m, detail) => {
                         return USE_TW ? ("需要手動確認：" + detail) : ("需要手动确认：" + detail);
                     });
-                                } else if (/^Command (exited|finished|completed|failed) with (?:exit )?code (\\d+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Command (exited|finished|completed|failed) with (?:exit )?code (\\d+)$/i, (m, verb, code) => {
-                        const vZh = /^failed/i.test(verb) ? (USE_TW ? "執行失敗" : "运行失败") : (USE_TW ? "已完成" : "已完成");
-                        return USE_TW ? ("指令" + vZh + "，結束碼為 " + code) : ("命令" + vZh + "，退出代码为 " + code);
-                    });
-                } else if (/^Command failed with error:?\\s*(.+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Command failed with error:?\\s*(.+)$/i, (m, err) => {
-                        return USE_TW ? ("指令執行失敗，錯誤訊息：" + err) : ("命令运行失败，错误信息：" + err);
-                    });
-                } else if (/^Command timed out after (\\d+)\\s*(s|sec|seconds?)?$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Command timed out after (\\d+)\\s*(s|sec|seconds?)?$/i, (m, num) => {
-                        return USE_TW ? ("指令在 " + num + " 秒後逾時") : ("命令在 " + num + " 秒后超时");
-                    });
-                } else if (/^Process finished with exit code (\\d+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Process finished with exit code (\\d+)$/i, (m, code) => {
-                        return USE_TW ? ("行程已結束，結束碼為 " + code) : ("进程已结束，退出代码为 " + code);
-                    });
                 } else if (/^Process terminated with signal (.+)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^Process terminated with signal (.+)$/i, (m, sig) => {
                         return USE_TW ? ("行程已被訊號 " + sig + " 終止") : ("进程已被信号 " + sig + " 终止");
                     });
-                } else if (/^Waiting for (.+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Waiting for (.+)$/i, (m, target) => {
-                        let tZh = target;
-                        let secMatch = target.match(/\\(up to (\\d+) seconds?\\)/i);
-                        let secStr = secMatch ? (USE_TW ? ("（最多 " + secMatch[1] + " 秒）") : ("（最多 " + secMatch[1] + " 秒）")) : "";
-                        let cleanTarget = target.replace(/\\(up to \\d+ seconds?\\)/i, '').trim();
-
-                        const targetMap = USE_TW ? {
-                            'command completion': '指令執行完成',
-                            'command to complete': '指令完成',
-                            'command to finish': '指令結束',
-                            'command output': '指令輸出',
-                            'subagent response': '子代理回應',
-                            'subagent completion': '子代理完成',
-                            'worker to finish': '工作者完成',
-                            'user confirmation': '使用者確認',
-                            'user input': '使用者輸入',
-                            'user approval': '使用者批准',
-                            'task completion': '任務完成',
-                            'background task': '背景任務'
-                        } : {
-                            'command completion': '命令运行完成',
-                            'command to complete': '命令完成',
-                            'command to finish': '命令结束',
-                            'command output': '命令输出',
-                            'subagent response': '子智能体响应',
-                            'subagent completion': '子智能体完成',
-                            'worker to finish': '工作进程完成',
-                            'user confirmation': '用户确认',
-                            'user input': '用户输入',
-                            'user approval': '用户审批',
-                            'task completion': '任务完成',
-                            'background task': '后台任务'
-                        };
-                        const mapped = targetMap[cleanTarget.toLowerCase()];
-                        if (mapped) tZh = mapped + (secStr ? " " + secStr : "");
-                        return (USE_TW ? "正在等待" : "正在等待") + tZh;
-                    });
-                } else if (/^Step (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Step (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => {
-                        return "步驟 " + a + " / " + b + rest;
-                    });
-                } else if (/^Step (\\d+):?\\s*(.+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Step (\\d+):?\\s*(.+)$/i, (m, num, desc) => {
-                        return "步驟 " + num + "：" + desc;
-                    });
-                } else if (/^Subtask (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Subtask (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => {
-                        return (USE_TW ? "子任務 " : "子任务 ") + a + " / " + b + rest;
-                    });
-                } else if (/^Subtask (\\d+):?\\s*(.+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Subtask (\\d+):?\\s*(.+)$/i, (m, num, desc) => {
-                        return (USE_TW ? "子任務 " : "子任务 ") + num + "：" + desc;
-                    });
-                } else if (/^Phase (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Phase (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => {
-                        return (USE_TW ? "階段 " : "阶段 ") + a + " / " + b + rest;
-                    });
-                } else if (/^Phase (\\d+):?\\s*(.+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Phase (\\d+):?\\s*(.+)$/i, (m, num, desc) => {
-                        return (USE_TW ? "階段 " : "阶段 ") + num + "：" + desc;
-                    });
-                } else if (/^Task (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Task (\\d+)\\s*(?:of|\\/)\\s*(\\d+)(.*)$/i, (m, a, b, rest) => {
-                        return (USE_TW ? "任務 " : "任务 ") + a + " / " + b + rest;
-                    });
-                } else if (/^Output truncated \\((?:showing )?(?:the )?(first|last) (\\d+) lines?\\)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Output truncated \\((?:showing )?(?:the )?(first|last) (\\d+) lines?\\)$/i, (m, pos, num) => {
-                        const pZh = /^first/i.test(pos) ? (USE_TW ? "前" : "前") : (USE_TW ? "後" : "后");
-                        return USE_TW ? ("輸出已截斷（顯示" + pZh + " " + num + " 行）") : ("输出已截断（显示" + pZh + " " + num + " 行）");
-                    });
-                } else if (/^Output truncated \\(([\\d,]+) bytes? total\\)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Output truncated \\(([\\d,]+) bytes? total\\)$/i, (m, bytes) => {
-                        return USE_TW ? ("輸出已截斷（共 " + bytes + " 位元組）") : ("输出已截断（共 " + bytes + " 字节）");
-                    });
                 } else if (/^Showing (first|last) (\\d+) lines?$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^Showing (first|last) (\\d+) lines?$/i, (m, pos, num) => {
-                        const pZh = /^first/i.test(pos) ? (USE_TW ? "前" : "前") : (USE_TW ? "後" : "后");
+                        const pZh = /^first/i.test(pos) ? "前" : (USE_TW ? "後" : "后");
                         return USE_TW ? ("顯示" + pZh + " " + num + " 行") : ("显示" + pZh + " " + num + " 行");
-                    });
-                } else if (/^Lines (\\d+)[–-](\\d+) of (\\d+)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Lines (\\d+)[–-](\\d+) of (\\d+)$/i, (m, a, b, total) => {
-                        return USE_TW ? ("第 " + a + "–" + b + " 行，共 " + total + " 行") : ("第 " + a + "–" + b + " 行，共 " + total + " 行");
                     });
                 } else if (/^Coordinator assigned task to (.+)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^Coordinator assigned task to (.+)$/i, (m, target) => {
@@ -1910,13 +1815,6 @@ function generateJs(preloadedDict) {
                     });
                 } else if (/^Hook will trigger if any tool is executed\\.$/i.test(valNorm)) {
                     newVal = USE_TW ? "執行任何工具時皆會觸發勾點。" : "运行任何工具时都会触发钩子。";
-                } else if (/^Checkpoint #?(\\d+)(.*)$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^Checkpoint #?(\\d+)(.*)$/i, (m, num, rest) => {
-                        let restZh = rest;
-                        restZh = restZh.replace(/\\(Steps (\\d+)[–-](\\d+)\\)/gi, (sm, s1, s2) => USE_TW ? ("（步驟 " + s1 + "–" + s2 + "）") : ("（步骤 " + s1 + "–" + s2 + "）"));
-                        restZh = restZh.replace(/\\(Intent Only\\)/gi, USE_TW ? "（僅限意圖）" : "（仅限意向）");
-                        return (USE_TW ? "檢查點 #" : "检查点 #") + num + restZh;
-                    });
                 } else if (/^In this case, (\\d+) chunks were collapsed into one\\.(.*)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^In this case, (\\d+) chunks were collapsed into one\\.(.*)$/i, (m, count, rest) => {
                         return USE_TW ? ("在此情況下，已將 " + count + " 個區塊合併為一個。" + rest) : ("在此情况下，已将 " + count + " 个分块合并为一个。" + rest);
@@ -1926,10 +1824,6 @@ function generateJs(preloadedDict) {
                         return USE_TW
                             ? ("網路搜尋優先採用來自 " + domain + " 的結果。LLM 判定此舉可取得最佳成效。若不需要，您可直接告知代理不要使用網域篩選。")
                             : ("网络搜索优先采用来自 " + domain + " 的结果。LLM 判定此举可获得最佳效果。如果不需要，您可以直接告知智能体不要使用域名过滤。");
-                    });
-                } else if (/^(.+) (?:need|needs) the terminal sandbox, which isn't available on this host\\.$/i.test(valNorm)) {
-                    newVal = valNorm.replace(/^(.+) (?:need|needs) the terminal sandbox, which isn't available on this host\\.$/i, (m, presets) => {
-                        return USE_TW ? (presets + " 需要終端機沙箱，但在此主機上不可用。") : (presets + " 需要终端沙箱，但在此主机上不可用。");
                     });
                 } else if (/^Skip \\((.+?)\\), Skip All \\((.+?)\\)$/i.test(valNorm)) {
                     newVal = valNorm.replace(/^Skip \\((.+?)\\), Skip All \\((.+?)\\)$/i, (m, k1, k2) => {
@@ -2037,7 +1931,7 @@ function generateJs(preloadedDict) {
                         }
                         return vZh + " " + cleanRest;
                     });
-                } else {
+                } else if (valNorm.length > 15) {
                     // 2. 长句子串滑动替换与末尾截断智能匹配 (仅当原句带有省略号截断时，才允许基于长前缀匹配)
                     for (const [key, translated] of longEntries) {
                         if (key.length > 15 && valNorm.includes(key)) {
@@ -2129,7 +2023,7 @@ function generateJs(preloadedDict) {
 })();
 ${SIGNATURE_END}`;
 
-    return jsSource.replace("DICT_PLACEHOLDER", dictJson).replace("REPLACEMENT_ENTRIES_PLACEHOLDER", entriesJson);
+    return jsSource.replace("DICT_PLACEHOLDER", () => dictJson);
 }
 
 function cleanJsContent(content) {
@@ -2267,26 +2161,27 @@ function getRunningStatus(targetInstallDir) {
             });
             const candidateAppPids = [];
             let hasDirectInstallerImg = false;
-            let hasInspectableUpdaterImg = false;
+            const inspectableUpdaterImgs = new Set();
             for (const line of stdout.split(/\r?\n/)) {
                 if (!line.trim()) continue;
                 const parts = line.split('","');
                 if (parts.length < 2) continue;
-                const imgName = parts[0].replace(/^"/, '').trim().toLowerCase();
+                const rawImgName = parts[0].replace(/^"/, '').trim();
+                const imgName = rawImgName.toLowerCase();
                 const pid = parseInt(parts[1].replace(/"/g, '').trim(), 10);
                 if (imgName === 'antigravity.exe' && !isNaN(pid) && pid !== selfPid) {
                     candidateAppPids.push(pid);
                 } else if (imgName === 'antigravity-x64.exe' || imgName === 'antigravity-arm64.exe' || imgName === 'uninstall antigravity.exe') {
                     hasDirectInstallerImg = true;
                 } else if (imgName === 'installer.exe' || imgName === 'elevate.exe' || imgName === 'old-uninstaller.exe' || /^au_.*\.exe$/i.test(imgName)) {
-                    hasInspectableUpdaterImg = true;
+                    inspectableUpdaterImgs.add(rawImgName);
                 }
             }
             if (hasDirectInstallerImg) updaterRunning = true;
 
             const queryNames = [];
             if (candidateAppPids.length > 0) queryNames.push('Antigravity.exe');
-            if (hasInspectableUpdaterImg && !updaterRunning) queryNames.push('installer.exe', 'elevate.exe', 'old-uninstaller.exe', 'Au_.exe');
+            if (inspectableUpdaterImgs.size > 0 && !updaterRunning) queryNames.push(...inspectableUpdaterImgs);
 
             const targetDirLower = targetInstallDir ? normalizeWinPathLower(targetInstallDir) : '';
             if (queryNames.length > 0) {
@@ -2954,11 +2849,11 @@ function install20(resourcesDir) {
             const res = origItemsFind(pred, thisArg);
             if (res) return res;
             if (typeof pred === 'function') {
-                return origItemsFind((it) => it && (it.label === '檔案' || it.label === '文件') && (() => { try { return pred({ ...it, label: 'File' }); } catch (e) { return false; } })(), thisArg);
+                return origItemsFind((it) => it && (it.label === '檔案' || it.label === '檔案(&F)' || it.label === '文件' || it.label === '文件(&F)') && (() => { try { return pred({ ...it, label: 'File' }) || pred({ ...it, label: '&File' }); } catch (e) { return false; } })(), thisArg);
             }
             return res;
         };
-        const fileItem = origItemsFind((it) => it && it.label === 'File');
+        const fileItem = origItemsFind((it) => it && (it.label === 'File' || it.label === '&File'));
         if (fileItem && fileItem.submenu && typeof fileItem.submenu.insert === 'function') {
             const origInsert = fileItem.submenu.insert.bind(fileItem.submenu);
             fileItem.submenu.insert = function(pos, mi) {
@@ -3159,9 +3054,26 @@ function install20(resourcesDir) {
         const targetWsl = `title: 'WSL distro not found',`;
         const replaceWsl = USE_TW ? `title: '找不到 WSL 發行版',` : `title: '未找到 WSL 发行版',`;
         mainContent = mainContent.replace(targetWsl, replaceWsl);
+        const targetWslMsg = 'message: `The WSL distro "${WSL_DISTRO}" is no longer installed.`,';
+        const replaceWslMsg = USE_TW
+            ? 'message: `WSL 發行版「${WSL_DISTRO}」已不再安裝。`,'
+            : 'message: `WSL 发行版“${WSL_DISTRO}”已不再安装。`,';
+        mainContent = mainContent.replace(targetWslMsg, replaceWslMsg);
         const targetWslDetail = `detail: 'Antigravity opened on Windows instead.',`;
         const replaceWslDetail = USE_TW ? `detail: '已改為在 Windows 環境開啟 Antigravity。',` : `detail: '已改为在 Windows 中打开 Antigravity。',`;
         mainContent = mainContent.replace(targetWslDetail, replaceWslDetail);
+        mainContent = mainContent.replace(
+            `showErrorBox('WSL setup failed', msg)`,
+            USE_TW ? `showErrorBox('WSL 設定失敗', msg)` : `showErrorBox('WSL 设置失败', msg)`
+        );
+        mainContent = mainContent.replace(
+            `showErrorBox('Binary not found', msg)`,
+            USE_TW ? `showErrorBox('找不到執行檔', msg)` : `showErrorBox('未找到可执行文件', msg)`
+        );
+        mainContent = mainContent.replace(
+            `showErrorBox('Startup failed', msg)`,
+            USE_TW ? `showErrorBox('啟動失敗', msg)` : `showErrorBox('启动失败', msg)`
+        );
         replacements['dist/main.js'] = mainContent;
     }
 
